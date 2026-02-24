@@ -9,7 +9,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_timer.h"
-#include "lvgl.h"
+
 #include "esp_spiffs.h"
 
 // -------------------- Display config --------------------
@@ -30,12 +30,18 @@
 #define PIN_NUM_RST            3
 #define PIN_NUM_LED            8
 
-#define LVGL_TICK_PERIOD_MS    2
-#define LVGL_BUFFER_LINES      40
+esp_lcd_panel_handle_t s_panel_handle;
 
-static esp_lcd_panel_handle_t s_panel_handle;
-static lv_display_t *s_display;
-
+void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
+    // Allocate a buffer for one line
+    uint16_t line_buf[w];
+    for (uint16_t i = 0; i < w; ++i) {
+        line_buf[i] = color;
+    }
+    for (uint16_t row = 0; row < h; ++row) {
+        esp_lcd_panel_draw_bitmap(s_panel_handle, x, y + row, x + w, y + row + 1, line_buf);
+    }
+}
 // -------------------- LED blink task --------------------
 static void led_blink_task(void *arg)
 {
@@ -49,29 +55,6 @@ static void led_blink_task(void *arg)
     }
 }
 
-// -------------------- LVGL tick --------------------
-static void lvgl_tick_cb(void *arg)
-{
-    (void)arg;
-    lv_tick_inc(LVGL_TICK_PERIOD_MS);
-}
-
-// -------------------- LVGL flush callback --------------------
-static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *color_map)
-{
-    // esp_lcd_panel_set_gap() already handles X/Y offsets.
-    const int x1 = area->x1;
-    const int y1 = area->y1;
-    const int x2 = area->x2;
-    const int y2 = area->y2;
-
-    // Draw bitmap: end coords are exclusive => +1
-    esp_lcd_panel_draw_bitmap(s_panel_handle, x1, y1, x2 + 1, y2 + 1, color_map);
-
-    // Signal LVGL we’re done flushing this area
-    lv_display_flush_ready(disp);
-}
-
 // -------------------- ST7789 init --------------------
 static void init_st7789(void)
 {
@@ -81,7 +64,7 @@ static void init_st7789(void)
         .miso_io_num     = -1,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = LCD_H_RES * LVGL_BUFFER_LINES * sizeof(uint16_t),
+        .max_transfer_sz = LCD_H_RES * 40 * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
@@ -116,60 +99,6 @@ static void init_st7789(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel_handle, true));
 }
 
-// -------------------- LVGL init (double buffer kept) --------------------
-static void init_lvgl(void)
-{
-    lv_init();
-
-    const size_t buffer_size = LCD_H_RES * LVGL_BUFFER_LINES * sizeof(uint16_t);
-
-    void *buf1 = heap_caps_malloc(buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    void *buf2 = heap_caps_malloc(buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    assert(buf1 && buf2);
-
-    s_display = lv_display_create(LCD_H_RES, LCD_V_RES);
-    lv_display_set_color_format(s_display, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_flush_cb(s_display, lvgl_flush_cb);
-
-    // Double buffering (kept)
-    lv_display_set_buffers(s_display, buf1, buf2, buffer_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-    // LVGL tick timer
-    const esp_timer_create_args_t tick_args = {
-        .callback = lvgl_tick_cb,
-        .name     = "lvgl_tick",
-    };
-    esp_timer_handle_t tick_timer = NULL;
-    ESP_ERROR_CHECK(esp_timer_create(&tick_args, &tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000));
-}
-
-// -------------------- Create UI (called from LVGL task) --------------------
-static void create_ui(void)
-{
-    // Draw a red square in the center
-    lv_obj_t *square = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(square, 40, 40); // 40x40 pixels
-    lv_obj_set_style_bg_color(square, lv_color_hex(0xFF0000), 0); // Red
-    lv_obj_set_style_border_width(square, 0, 0);
-    lv_obj_align(square, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(square, 0, 0);
-}
-
-// -------------------- LVGL task (single owner -> no mutex) --------------------
-static void lvgl_task(void *arg)
-{
-    (void)arg;
-
-    create_ui();
-
-    while (1) {
-        uint32_t wait_ms = lv_timer_handler();
-        if (wait_ms > 50) wait_ms = 50;
-        vTaskDelay(pdMS_TO_TICKS(wait_ms));
-    }
-}
-
 // -------------------- app_main --------------------
 void app_main(void)
 {
@@ -193,9 +122,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs_conf));
 
     init_st7789();
-    init_lvgl();
-    lv_fs_posix_init();
-
-    xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 4, NULL);
+    draw_rect(10, 10, 50, 30, 0xF800); // RGB565 red
+    // LVGL removed: add manual display code here
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
