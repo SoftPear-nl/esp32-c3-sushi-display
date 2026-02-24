@@ -1,19 +1,16 @@
 #include <stdbool.h>
 #include <assert.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_timer.h"
-
 #include "lvgl.h"
+#include "esp_spiffs.h"
 
 // -------------------- Display config --------------------
 #define LCD_HOST               SPI2_HOST
@@ -186,8 +183,18 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(gpio_config(&led_cfg));
 
+    // Mount SPIFFS
+    esp_vfs_spiffs_conf_t spiffs_conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs_conf));
+
     init_st7789();
     init_lvgl();
+    lv_fs_posix_init();
 
     xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 4, NULL);
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
