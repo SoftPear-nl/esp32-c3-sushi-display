@@ -154,7 +154,9 @@ static void create_ui(void)
     lv_obj_t *square = lv_obj_create(lv_screen_active());
     lv_obj_set_size(square, 40, 40); // 40x40 pixels
     lv_obj_set_style_bg_color(square, lv_color_hex(0xFF0000), 0); // Red
+    lv_obj_set_style_border_width(square, 0, 0);
     lv_obj_align(square, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(square, 0, 0);
 }
 
 // -------------------- LVGL task (single owner -> no mutex) --------------------
