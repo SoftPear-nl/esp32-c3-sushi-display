@@ -15,17 +15,17 @@
 // -------------------- Display config --------------------
 #define LCD_HOST               SPI2_HOST
 
-#define LCD_V_RES              76
-#define LCD_H_RES              284
-#define LCD_X_OFFSET           18
-#define LCD_Y_OFFSET           82
+#define LCD_H_RES              76
+#define LCD_V_RES              284
+#define LCD_Y_OFFSET           18
+#define LCD_X_OFFSET           82
 
 // Panel color order: set to 1 for RGB, 0 for BGR
 #define PANEL_COLOR_ORDER_RGB  1
 
-#define PIN_NUM_MOSI           6   // Super Mini MOSI
-#define PIN_NUM_SCLK           5   // Super Mini SCK
-#define PIN_NUM_CS             7   // Super Mini SS
+#define PIN_NUM_MOSI           0   // Super Mini MOSI
+#define PIN_NUM_SCLK           1   // Super Mini SCK
+#define PIN_NUM_CS             4   // Super Mini SS
 #define PIN_NUM_DC             2
 #define PIN_NUM_RST            3
 #define PIN_NUM_LED            8
@@ -132,10 +132,7 @@ static void init_st7789(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel_handle, LCD_X_OFFSET, LCD_Y_OFFSET));
 
-    // Your orientation choices preserved
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel_handle, true, false));
-
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel_handle, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel_handle, true));
 }
 
@@ -163,7 +160,7 @@ void app_main(void)
 
     init_st7789();
 
-    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 400, 446, 0, 0, 284, 76, 0, 0, 66, 400);  
+    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256);  
 
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
