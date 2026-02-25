@@ -41,51 +41,81 @@ esp_lcd_panel_handle_t s_panel_handle;
 typedef uint16_t (*color_swap_fn)(uint16_t);
 
 // Generalized bitmap draw with color swap function
+// direction: 0 = horizontal, 1 = vertical
 void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t bmp_height,
                                   uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                                   uint16_t bmp_x, uint16_t bmp_y,
-                                  size_t header_size, uint16_t row_stride) {
+                                  size_t header_size, uint16_t row_stride,
+                                  uint8_t direction, uint16_t speed_ms) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         printf("Failed to open bitmap: %s\n", path);
         return;
     }
-    uint16_t *row_buf = heap_caps_malloc(w * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (!row_buf) {
-        printf("Failed to allocate row buffer\n");
+    // Allocate full image buffer
+    uint16_t *img_buf = heap_caps_malloc(bmp_width * bmp_height * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!img_buf) {
+        printf("Failed to allocate full image buffer\n");
         fclose(f);
         return;
+    }
+    // Read full image into buffer
+    for (uint16_t row = 0; row < bmp_height; ++row) {
+        size_t offset = header_size + row * row_stride * sizeof(uint16_t);
+        fseek(f, offset, SEEK_SET);
+        size_t read = fread(&img_buf[row * bmp_width], sizeof(uint16_t), bmp_width, f);
+        if (read != bmp_width) {
+            printf("Failed to read row %u\n", row);
+            free(img_buf);
+            fclose(f);
+            return;
+        }
+        // Swap bytes for each pixel
+        for (uint16_t col = 0; col < bmp_width; ++col) {
+            img_buf[row * bmp_width + col] = (img_buf[row * bmp_width + col] >> 8) | (img_buf[row * bmp_width + col] << 8);
+        }
+        vTaskDelay(1);
+    }
+    fclose(f);
+
+    uint16_t pan_steps = 0;
+    if (direction == 0) {
+        pan_steps = bmp_width - w;
+    } else {
+        pan_steps = bmp_height - h;
     }
     uint16_t *rect_buf = heap_caps_malloc(w * h * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!rect_buf) {
         printf("Failed to allocate rect buffer\n");
-        free(row_buf);
-        fclose(f);
+        free(img_buf);
         return;
     }
-    for (uint16_t row = 0; row < h; ++row) {
-        uint16_t bmp_row = bmp_y + row;
-        if (bmp_row >= bmp_height) break;
-        size_t offset = header_size + (bmp_row * row_stride + bmp_x) * sizeof(uint16_t);
-        fseek(f, offset, SEEK_SET);
-        size_t read = fread(row_buf, sizeof(uint16_t), w, f);
-        if (read != w) {
-            printf("Failed to read row %u\n", bmp_row);
-            break;
+    for (uint16_t step = 0; step <= pan_steps; ++step) {
+        uint16_t cur_bmp_x = bmp_x;
+        uint16_t cur_bmp_y = bmp_y;
+        if (direction == 0) {
+            cur_bmp_x = step;
+        } else {
+            cur_bmp_y = step;
         }
-        for (uint16_t col = 0; col < w; ++col) {
-            // Always swap bytes for each pixel
-            uint16_t px = row_buf[col];
-            px = (px >> 8) | (px << 8);
-            rect_buf[row * w + col] = px;
+        // Copy window from full image buffer
+        for (uint16_t row = 0; row < h; ++row) {
+            for (uint16_t col = 0; col < w; ++col) {
+                uint16_t src_row = cur_bmp_y + row;
+                uint16_t src_col = cur_bmp_x + col;
+                if (src_row < bmp_height && src_col < bmp_width) {
+                    rect_buf[row * w + col] = img_buf[src_row * bmp_width + src_col];
+                } else {
+                    rect_buf[row * w + col] = 0;
+                }
+            }
         }
-        // Yield to scheduler to avoid task watchdog
-        vTaskDelay(1);
+        esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
+        vTaskDelay(pdMS_TO_TICKS(speed_ms));
     }
-    esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
-    free(row_buf);
     free(rect_buf);
-    fclose(f);
+    free(img_buf);
+
 }
 
 // -------------------- LED blink task --------------------
@@ -145,7 +175,7 @@ static void led_blink_task(void *arg)
 static void draw_bitmap_task(void *arg)
 {
     (void)arg;
-    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256);
+    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256, 0, 1);
     vTaskDelete(NULL);
 }
 
@@ -225,5 +255,5 @@ void app_main(void)
     // Start bitmap drawing task
     xTaskCreate(draw_bitmap_task, "draw_bitmap", 4096, NULL, 2, NULL);
 
-    xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
+   // xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
