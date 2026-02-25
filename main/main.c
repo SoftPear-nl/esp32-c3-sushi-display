@@ -33,15 +33,16 @@
 esp_lcd_panel_handle_t s_panel_handle;
 
 void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
-    // Allocate a buffer for one line
-    uint16_t line_buf[w];
-    for (uint16_t i = 0; i < w; ++i) {
-        line_buf[i] = color;
+    // Allocate a buffer for the full rectangle
+    uint16_t *rect_buf = heap_caps_malloc(w * h * sizeof(uint16_t), MALLOC_CAP_DMA);
+    assert(rect_buf != NULL);
+    for (uint32_t i = 0; i < w * h; ++i) {
+        rect_buf[i] = color;
     }
-    for (uint16_t row = 0; row < h; ++row) {
-        esp_lcd_panel_draw_bitmap(s_panel_handle, x, y + row, x + w, y + row + 1, line_buf);
-    }
+    esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
+    heap_caps_free(rect_buf);
 }
+
 // -------------------- LED blink task --------------------
 static void led_blink_task(void *arg)
 {
@@ -66,7 +67,7 @@ static void init_st7789(void)
         .quadhd_io_num   = -1,
         .max_transfer_sz = LCD_H_RES * 40 * sizeof(uint16_t),
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_DISABLED));
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
