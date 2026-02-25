@@ -28,7 +28,13 @@
 #define PIN_NUM_CS             4   // Super Mini SS
 #define PIN_NUM_DC             2
 #define PIN_NUM_RST            3
-#define PIN_NUM_LED            8
+//#define PIN_NUM_LED            8
+
+#define PIN_LETTER_S1       5
+#define PIN_LETTER_U        6
+#define PIN_LETTER_S2       7
+#define PIN_LETTER_H        8
+#define PIN_LETTER_I        9
 
 esp_lcd_panel_handle_t s_panel_handle;
 
@@ -73,6 +79,8 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
             px = (px >> 8) | (px << 8);
             rect_buf[row * w + col] = px;
         }
+        // Yield to scheduler to avoid task watchdog
+        vTaskDelay(1);
     }
     esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
     free(row_buf);
@@ -81,16 +89,64 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
 }
 
 // -------------------- LED blink task --------------------
+static void led_alternate(){
+    for (int i = 0; i < 10; ++i) {
+        for (int j = 0; j < 5; ++j) {
+            gpio_set_level(PIN_LETTER_S1, j==0 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_U, j==1 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_S2, j==2 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_H, j==3 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_I, j==4 ? 1 : 0);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+}
+
+static void led_wave(){
+    for (int i = 0; i < 10; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            gpio_set_level(PIN_LETTER_S1, j==0 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_U, j==1 || j==7 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_S2, j==2 || j==6 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_H, j==3 || j==5 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_I, j==4 ? 1 : 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+static void led_full_flicker(){
+    bool on = false;
+    for (int i = 0; i < 10; ++i) {
+        on = !on;
+        for (int j = 0; j < 2; ++j) {
+            gpio_set_level(PIN_LETTER_S1, on);
+            gpio_set_level(PIN_LETTER_U, on);
+            gpio_set_level(PIN_LETTER_S2, on);
+            gpio_set_level(PIN_LETTER_H, on);
+            gpio_set_level(PIN_LETTER_I, on);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+}
+
 static void led_blink_task(void *arg)
 {
     (void)arg;
-    bool led_on = false;
 
     while (1) {
-        led_on = !led_on;
-        gpio_set_level(PIN_NUM_LED, led_on);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        led_alternate();
+        led_wave();
+        led_full_flicker();
     }
+}
+
+// -------------------- Bitmap draw task --------------------
+static void draw_bitmap_task(void *arg)
+{
+    (void)arg;
+    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256);
+    vTaskDelete(NULL);
 }
 
 // -------------------- ST7789 init --------------------
@@ -139,9 +195,14 @@ static void init_st7789(void)
 // -------------------- app_main --------------------
 void app_main(void)
 {
-    // LED GPIO
+    // LED GPIOs (main LED + letter LEDs)
     gpio_config_t led_cfg = {
-        .pin_bit_mask = 1ULL << PIN_NUM_LED,
+        .pin_bit_mask =
+            (1ULL << PIN_LETTER_S1)
+            | (1ULL << PIN_LETTER_U)
+            | (1ULL << PIN_LETTER_S2)
+            | (1ULL << PIN_LETTER_H)
+            | (1ULL << PIN_LETTER_I),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -160,7 +221,9 @@ void app_main(void)
 
     init_st7789();
 
-    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256);  
+
+    // Start bitmap drawing task
+    xTaskCreate(draw_bitmap_task, "draw_bitmap", 4096, NULL, 2, NULL);
 
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
