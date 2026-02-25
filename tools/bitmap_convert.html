@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Image → BMP RGB565 (BI_BITFIELDS) for ESP32/ST7789</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; min-width: 280px; }
+    label { display:block; margin: 8px 0 4px; font-size: 14px; }
+    input[type="number"] { width: 110px; }
+    input[type="range"] { width: 240px; }
+    canvas { border: 1px solid #ddd; border-radius: 10px; image-rendering: pixelated; }
+    .small { font-size: 12px; color: #444; line-height: 1.35; }
+    .warn { color: #8a4b00; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .grid { display: grid; grid-template-columns: auto auto; gap: 8px 12px; align-items: center; }
+    .pill { display:inline-block; padding: 2px 8px; border:1px solid #ddd; border-radius: 999px; font-size: 12px; background:#fafafa; }
+  </style>
+</head>
+<body>
+  <h2>Convert image to 16-bit BMP RGB565 (BI_BITFIELDS)</h2>
+  <p class="small">
+    This creates a <b>16bpp BMP</b> with <b>BI_BITFIELDS</b> masks <span class="pill">R=0xF800</span> <span class="pill">G=0x07E0</span> <span class="pill">B=0x001F</span>,
+    ideal for your ESP32 streaming renderer.<br>
+    Output BMP is saved as <b>top-down</b> (negative height) to simplify reading (still valid BMP).
+  </p>
+
+  <div class="row">
+    <div class="card">
+      <label>1) Choose image</label>
+      <input id="file" type="file" accept="image/*" />
+
+      <label>2) Target size (px)</label>
+      <div class="grid">
+        <div>Width</div>  <input id="outW" type="number" value="284" min="1" step="1" />
+        <div>Height</div> <input id="outH" type="number" value="76" min="1" step="1" />
+      </div>
+
+      <label>Fit mode</label>
+      <div class="grid">
+        <label><input type="radio" name="fit" value="contain" checked /> Contain (letterbox)</label>
+        <label><input type="radio" name="fit" value="cover" /> Cover (crop to fill)</label>
+      </div>
+
+      <label>Dithering (optional)</label>
+      <div class="grid">
+        <label><input id="dither" type="checkbox" /> Floyd–Steinberg dither to RGB565</label>
+      </div>
+      <p class="small warn">
+        Dithering improves gradients on RGB565, but is slower.
+      </p>
+
+      <label>Preview zoom</label>
+      <input id="zoom" type="range" min="1" max="8" value="2" />
+      <div class="small">Zoom: <span id="zoomVal">2×</span></div>
+
+      <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
+        <button id="btnRender" disabled>Render preview</button>
+        <button id="btnExport" disabled>Download BMP (RGB565)</button>
+      </div>
+
+      <p class="small" id="status" style="margin-top:10px;"></p>
+    </div>
+
+    <div class="card">
+      <div class="small" style="margin-bottom:8px;">
+        Preview canvas (exact output pixels).<br>
+        Tip: Set <b>284×76</b> for your configured LCD window.
+      </div>
+      <canvas id="cv" width="284" height="76"></canvas>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const fileEl = document.getElementById('file');
+  const outWEl = document.getElementById('outW');
+  const outHEl = document.getElementById('outH');
+  const zoomEl = document.getElementById('zoom');
+  const zoomValEl = document.getElementById('zoomVal');
+  const btnRender = document.getElementById('btnRender');
+  const btnExport = document.getElementById('btnExport');
+  const statusEl = document.getElementById('status');
+  const ditherEl = document.getElementById('dither');
+  const canvas = document.getElementById('cv');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  let img = null;
+  let lastImageData = null;
+
+  function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+  function getFitMode() {
+    const r = document.querySelector('input[name="fit"]:checked');
+    return r ? r.value : 'contain';
+  }
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function loadImageFromFile(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const im = new Image();
+      im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+      im.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+      im.src = url;
+    });
+  }
+
+  function resizeCanvasToOutput() {
+    const w = clamp(parseInt(outWEl.value || '1', 10), 1, 10000);
+    const h = clamp(parseInt(outHEl.value || '1', 10), 1, 10000);
+    canvas.width = w;
+    canvas.height = h;
+
+    const z = parseInt(zoomEl.value, 10);
+    canvas.style.width = (w * z) + 'px';
+    canvas.style.height = (h * z) + 'px';
+    zoomValEl.textContent = z + '×';
+  }
+
+  function drawToCanvas() {
+    if (!img) return;
+
+    resizeCanvasToOutput();
+    const outW = canvas.width;
+    const outH = canvas.height;
+
+    // Fill background black (for contain letterbox)
+    ctx.save();
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,outW,outH);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,outW,outH);
+    ctx.restore();
+
+    const fit = getFitMode();
+
+    const iw = img.naturalWidth || img.width;
+    const ih = img.naturalHeight || img.height;
+
+    const sx = 0, sy = 0, sw = iw, sh = ih;
+
+    // compute destination rect
+    const scaleContain = Math.min(outW / iw, outH / ih);
+    const scaleCover   = Math.max(outW / iw, outH / ih);
+    const scale = (fit === 'cover') ? scaleCover : scaleContain;
+
+    const dw = Math.round(iw * scale);
+    const dh = Math.round(ih * scale);
+
+    const dx = Math.floor((outW - dw) / 2);
+    const dy = Math.floor((outH - dh) / 2);
+
+    // High quality scaling; you can turn this off for pixel art
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+
+    lastImageData = ctx.getImageData(0, 0, outW, outH);
+
+    setStatus(`Rendered ${outW}×${outH}. Source ${iw}×${ih}. Mode: ${fit}. Dither: ${ditherEl.checked ? 'on' : 'off'}`);
+  }
+
+  // --- RGB565 conversion helpers ---
+  function toRGB565(r, g, b) {
+    // 5-6-5 packing: RRRRRGGGGGGBBBBB
+    const rr = (r & 0xF8) << 8;
+    const gg = (g & 0xFC) << 3;
+    const bb = (b >> 3);
+    return (rr | gg | bb) & 0xFFFF;
+  }
+
+  function rgb565ToRgb888(v) {
+    // Expand to 8-bit with bit replication-ish
+    const r5 = (v >> 11) & 0x1F;
+    const g6 = (v >> 5) & 0x3F;
+    const b5 = v & 0x1F;
+    const r = (r5 << 3) | (r5 >> 2);
+    const g = (g6 << 2) | (g6 >> 4);
+    const b = (b5 << 3) | (b5 >> 2);
+    return [r, g, b];
+  }
+
+  // Floyd–Steinberg dithering in-place on RGBA buffer, then quantize to RGB565 words
+  function quantizeToRGB565Words(imageData, useDither) {
+    const { width, height, data } = imageData;
+    const out = new Uint16Array(width * height);
+
+    if (!useDither) {
+      for (let i = 0, p = 0; p < out.length; p++, i += 4) {
+        const r = data[i], g = data[i+1], b = data[i+2];
+        out[p] = toRGB565(r, g, b);
+      }
+      return out;
+    }
+
+    // Work on float copies to accumulate error
+    const rf = new Float32Array(width * height);
+    const gf = new Float32Array(width * height);
+    const bf = new Float32Array(width * height);
+
+    for (let p = 0, i = 0; p < out.length; p++, i += 4) {
+      rf[p] = data[i];
+      gf[p] = data[i+1];
+      bf[p] = data[i+2];
+    }
+
+    function idx(x, y) { return y * width + x; }
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const p = idx(x,y);
+
+        const r0 = clamp(Math.round(rf[p]), 0, 255);
+        const g0 = clamp(Math.round(gf[p]), 0, 255);
+        const b0 = clamp(Math.round(bf[p]), 0, 255);
+
+        const q = toRGB565(r0, g0, b0);
+        out[p] = q;
+
+        const [r1, g1, b1] = rgb565ToRgb888(q);
+        const er = r0 - r1;
+        const eg = g0 - g1;
+        const eb = b0 - b1;
+
+        // distribute error
+        // (x+1, y)   7/16
+        // (x-1, y+1) 3/16
+        // (x,   y+1) 5/16
+        // (x+1, y+1) 1/16
+        if (x + 1 < width) {
+          const p1 = idx(x+1, y);
+          rf[p1] += er * 7/16; gf[p1] += eg * 7/16; bf[p1] += eb * 7/16;
+        }
+        if (y + 1 < height) {
+          if (x > 0) {
+            const p2 = idx(x-1, y+1);
+            rf[p2] += er * 3/16; gf[p2] += eg * 3/16; bf[p2] += eb * 3/16;
+          }
+          {
+            const p3 = idx(x, y+1);
+            rf[p3] += er * 5/16; gf[p3] += eg * 5/16; bf[p3] += eb * 5/16;
+          }
+          if (x + 1 < width) {
+            const p4 = idx(x+1, y+1);
+            rf[p4] += er * 1/16; gf[p4] += eg * 1/16; bf[p4] += eb * 1/16;
+          }
+        }
+      }
+    }
+
+    return out;
+  }
+
+  // --- BMP writer: 16bpp BI_BITFIELDS RGB565 ---
+  // We write a TOP-DOWN BMP by using negative height, so pixel rows are stored top->bottom.
+  // Row is padded to 4 bytes.
+  function makeBmpRgb565TopDown(width, height, rgb565Words) {
+    const bytesPerPixel = 2;
+    const rowBytes = width * bytesPerPixel;
+    const rowStride = (rowBytes + 3) & ~3; // 4-byte aligned
+    const pixelArraySize = rowStride * height;
+
+    const FILE_HEADER_SIZE = 14;
+    const INFO_HEADER_SIZE = 40;
+    const MASKS_SIZE = 12; // R,G,B
+    const pixelDataOffset = FILE_HEADER_SIZE + INFO_HEADER_SIZE + MASKS_SIZE;
+    const fileSize = pixelDataOffset + pixelArraySize;
+
+    const buf = new ArrayBuffer(fileSize);
+    const dv = new DataView(buf);
+    const u8 = new Uint8Array(buf);
+
+    let o = 0;
+
+    // BITMAPFILEHEADER (14)
+    dv.setUint16(o, 0x4D42, true); o += 2;     // bfType 'BM'
+    dv.setUint32(o, fileSize, true); o += 4;   // bfSize
+    dv.setUint16(o, 0, true); o += 2;          // bfReserved1
+    dv.setUint16(o, 0, true); o += 2;          // bfReserved2
+    dv.setUint32(o, pixelDataOffset, true); o += 4; // bfOffBits
+
+    // BITMAPINFOHEADER (40)
+    dv.setUint32(o, INFO_HEADER_SIZE, true); o += 4; // biSize
+    dv.setInt32(o, width, true); o += 4;             // biWidth
+    dv.setInt32(o, -height, true); o += 4;           // biHeight (negative => top-down)
+    dv.setUint16(o, 1, true); o += 2;                // biPlanes
+    dv.setUint16(o, 16, true); o += 2;               // biBitCount
+    dv.setUint32(o, 3, true); o += 4;                // biCompression = BI_BITFIELDS
+    dv.setUint32(o, pixelArraySize, true); o += 4;   // biSizeImage
+    dv.setInt32(o, 2835, true); o += 4;              // biXPelsPerMeter (~72dpi)
+    dv.setInt32(o, 2835, true); o += 4;              // biYPelsPerMeter
+    dv.setUint32(o, 0, true); o += 4;                // biClrUsed
+    dv.setUint32(o, 0, true); o += 4;                // biClrImportant
+
+    // Masks (R,G,B) right after info header
+    dv.setUint32(o, 0xF800, true); o += 4;
+    dv.setUint32(o, 0x07E0, true); o += 4;
+    dv.setUint32(o, 0x001F, true); o += 4;
+
+    // Pixel data: top-down rows (because negative height)
+    // BMP stores pixels as little-endian words. We write Uint16 little-endian.
+    let p = 0; // index into rgb565Words
+    let base = pixelDataOffset;
+
+    for (let y = 0; y < height; y++) {
+      let rowOff = base + y * rowStride;
+
+      for (let x = 0; x < width; x++, p++) {
+        dv.setUint16(rowOff + x * 2, rgb565Words[p], true);
+      }
+
+      // padding bytes left as 0
+    }
+
+    return new Blob([buf], { type: "image/bmp" });
+  }
+
+  function downloadBlob(blob, filename) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+
+  async function handleFile() {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) {
+      img = null;
+      lastImageData = null;
+      btnRender.disabled = true;
+      btnExport.disabled = true;
+      setStatus('');
+      return;
+    }
+    setStatus('Loading image…');
+    try {
+      img = await loadImageFromFile(f);
+      btnRender.disabled = false;
+      btnExport.disabled = true;
+      setStatus(`Loaded ${f.name} (${img.naturalWidth}×${img.naturalHeight}). Click "Render preview".`);
+    } catch (e) {
+      console.error(e);
+      setStatus('Failed to load image.');
+    }
+  }
+
+  function renderAndEnableExport() {
+    if (!img) return;
+    drawToCanvas();
+    btnExport.disabled = !lastImageData;
+  }
+
+  function exportBmp() {
+    if (!lastImageData) return;
+
+    const w = lastImageData.width;
+    const h = lastImageData.height;
+
+    setStatus('Converting to RGB565…');
+    const rgb565 = quantizeToRGB565Words(lastImageData, ditherEl.checked);
+
+    setStatus('Writing BMP…');
+    const blob = makeBmpRgb565TopDown(w, h, rgb565);
+
+    const nameBase = (fileEl.files && fileEl.files[0]) ? fileEl.files[0].name.replace(/\.[^.]+$/, '') : 'image';
+    downloadBlob(blob, `${nameBase}_${w}x${h}_rgb565.bmp`);
+
+    setStatus(`Downloaded BMP RGB565 (${w}×${h}).`);
+  }
+
+  // UI wiring
+  fileEl.addEventListener('change', handleFile);
+  btnRender.addEventListener('click', renderAndEnableExport);
+  btnExport.addEventListener('click', exportBmp);
+
+  [outWEl, outHEl, zoomEl].forEach(el => el.addEventListener('input', () => {
+    resizeCanvasToOutput();
+    if (lastImageData) {
+      // keep preview consistent with new size only if re-rendered
+      btnExport.disabled = true;
+    }
+  }));
+
+  zoomEl.addEventListener('input', () => {
+    zoomValEl.textContent = zoomEl.value + '×';
+  });
+
+  document.querySelectorAll('input[name="fit"]').forEach(r => r.addEventListener('change', () => {
+    if (img) btnExport.disabled = true;
+  }));
+
+  ditherEl.addEventListener('change', () => {
+    if (img) btnExport.disabled = true;
+  });
+
+  // initial
+  resizeCanvasToOutput();
+  setStatus('Choose an image to begin.');
+})();
+</script>
+</body>
+</html>

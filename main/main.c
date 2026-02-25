@@ -32,25 +32,52 @@
 
 esp_lcd_panel_handle_t s_panel_handle;
 
-// Swap green and blue channels in RGB565
-static inline uint16_t swap_green_blue_rgb565(uint16_t c) {
-    uint16_t r = c & 0xF800;
-    uint16_t g = c & 0x07E0;
-    uint16_t b = c & 0x001F;
-    // Move green to blue, blue to green
-    return r | (b << 5) | (g >> 5);
-}
+typedef uint16_t (*color_swap_fn)(uint16_t);
 
-void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
-    printf("draw_rect: x=%u y=%u w=%u h=%u area=[%u,%u]x[%u,%u] bufsize=%u\n", x, y, w, h, x, x+w-1, y, y+h-1, w*h);
-    // Use a static buffer sized for the largest possible rectangle
-    static uint16_t rect_buf[LCD_H_RES * LCD_V_RES];
-    assert(w * h <= LCD_H_RES * LCD_V_RES);
-    uint16_t swapped = swap_green_blue_rgb565(color);
-    for (uint32_t i = 0; i < w * h; ++i) {
-        rect_buf[i] = swapped;
+// Generalized bitmap draw with color swap function
+void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t bmp_height,
+                                  uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                  uint16_t bmp_x, uint16_t bmp_y,
+                                  size_t header_size, uint16_t row_stride) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        printf("Failed to open bitmap: %s\n", path);
+        return;
+    }
+    uint16_t *row_buf = heap_caps_malloc(w * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!row_buf) {
+        printf("Failed to allocate row buffer\n");
+        fclose(f);
+        return;
+    }
+    uint16_t *rect_buf = heap_caps_malloc(w * h * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!rect_buf) {
+        printf("Failed to allocate rect buffer\n");
+        free(row_buf);
+        fclose(f);
+        return;
+    }
+    for (uint16_t row = 0; row < h; ++row) {
+        uint16_t bmp_row = bmp_y + row;
+        if (bmp_row >= bmp_height) break;
+        size_t offset = header_size + (bmp_row * row_stride + bmp_x) * sizeof(uint16_t);
+        fseek(f, offset, SEEK_SET);
+        size_t read = fread(row_buf, sizeof(uint16_t), w, f);
+        if (read != w) {
+            printf("Failed to read row %u\n", bmp_row);
+            break;
+        }
+        for (uint16_t col = 0; col < w; ++col) {
+            // Always swap bytes for each pixel
+            uint16_t px = row_buf[col];
+            px = (px >> 8) | (px << 8);
+            rect_buf[row * w + col] = px;
+        }
     }
     esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
+    free(row_buf);
+    free(rect_buf);
+    fclose(f);
 }
 
 // -------------------- LED blink task --------------------
@@ -93,9 +120,9 @@ static void init_st7789(void)
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_RST,
-        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
-        .rgb_endian     = LCD_RGB_DATA_ENDIAN_LITTLE, // 16-bit color data sent as low byte first
+        .rgb_endian     = LCD_RGB_DATA_ENDIAN_BIG // 16-bit color data sent as low byte first
         
     };
 
@@ -135,11 +162,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs_conf));
 
     init_st7789();
-    draw_rect(10, 10, 50, 30, 0xF800); // RGB565 red
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    draw_rect(70, 10, 50, 30, 0x07E0); // RGB565 green
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    draw_rect(130, 10, 50, 30, 0x001F); // RGB565 blue
-    // LVGL removed: add manual display code here
+
+    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 400, 446, 0, 0, 284, 76, 0, 0, 66, 400);  
+
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
