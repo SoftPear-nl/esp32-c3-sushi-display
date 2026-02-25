@@ -21,26 +21,36 @@
 #define LCD_Y_OFFSET           82
 
 // Panel color order: set to 1 for RGB, 0 for BGR
-#define PANEL_COLOR_ORDER_RGB  0
+#define PANEL_COLOR_ORDER_RGB  1
 
-#define PIN_NUM_MOSI           21
-#define PIN_NUM_SCLK           5
-#define PIN_NUM_CS             10
+#define PIN_NUM_MOSI           6   // Super Mini MOSI
+#define PIN_NUM_SCLK           5   // Super Mini SCK
+#define PIN_NUM_CS             7   // Super Mini SS
 #define PIN_NUM_DC             2
 #define PIN_NUM_RST            3
 #define PIN_NUM_LED            8
 
 esp_lcd_panel_handle_t s_panel_handle;
 
+// Swap green and blue channels in RGB565
+static inline uint16_t swap_green_blue_rgb565(uint16_t c) {
+    uint16_t r = c & 0xF800;
+    uint16_t g = c & 0x07E0;
+    uint16_t b = c & 0x001F;
+    // Move green to blue, blue to green
+    return r | (b << 5) | (g >> 5);
+}
+
 void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
-    // Allocate a buffer for the full rectangle
-    uint16_t *rect_buf = heap_caps_malloc(w * h * sizeof(uint16_t), MALLOC_CAP_DMA);
-    assert(rect_buf != NULL);
+    printf("draw_rect: x=%u y=%u w=%u h=%u area=[%u,%u]x[%u,%u] bufsize=%u\n", x, y, w, h, x, x+w-1, y, y+h-1, w*h);
+    // Use a static buffer sized for the largest possible rectangle
+    static uint16_t rect_buf[LCD_H_RES * LCD_V_RES];
+    assert(w * h <= LCD_H_RES * LCD_V_RES);
+    uint16_t swapped = swap_green_blue_rgb565(color);
     for (uint32_t i = 0; i < w * h; ++i) {
-        rect_buf[i] = color;
+        rect_buf[i] = swapped;
     }
     esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
-    heap_caps_free(rect_buf);
 }
 
 // -------------------- LED blink task --------------------
@@ -83,8 +93,10 @@ static void init_st7789(void)
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_RST,
-        .rgb_ele_order  = PANEL_COLOR_ORDER_RGB ? LCD_RGB_ELEMENT_ORDER_RGB : LCD_RGB_ELEMENT_ORDER_BGR,
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
+        .rgb_endian     = LCD_RGB_DATA_ENDIAN_LITTLE, // 16-bit color data sent as low byte first
+        
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel_handle));
@@ -124,6 +136,10 @@ void app_main(void)
 
     init_st7789();
     draw_rect(10, 10, 50, 30, 0xF800); // RGB565 red
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    draw_rect(70, 10, 50, 30, 0x07E0); // RGB565 green
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    draw_rect(130, 10, 50, 30, 0x001F); // RGB565 blue
     // LVGL removed: add manual display code here
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
