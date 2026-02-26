@@ -1,3 +1,4 @@
+#include "esp_log.h"
 #include <stdbool.h>
 #include <assert.h>
 #include "freertos/FreeRTOS.h"
@@ -47,13 +48,16 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
                                   uint16_t bmp_x, uint16_t bmp_y,
                                   size_t header_size, uint16_t row_stride,
                                   uint8_t direction, uint16_t speed_ms) {
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     FILE *f = fopen(path, "rb");
     if (!f) {
         printf("Failed to open bitmap: %s\n", path);
         return;
     }
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     // Allocate full image buffer
     uint16_t *img_buf = heap_caps_malloc(bmp_width * bmp_height * sizeof(uint16_t), MALLOC_CAP_DMA);
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     if (!img_buf) {
         printf("Failed to allocate full image buffer\n");
         fclose(f);
@@ -74,8 +78,9 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
         for (uint16_t col = 0; col < bmp_width; ++col) {
             img_buf[row * bmp_width + col] = (img_buf[row * bmp_width + col] >> 8) | (img_buf[row * bmp_width + col] << 8);
         }
-        vTaskDelay(1);
+        vTaskDelay(1);        
     }
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     fclose(f);
 
     uint16_t pan_steps = 0;
@@ -85,6 +90,7 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
         pan_steps = bmp_height - h;
     }
     uint16_t *rect_buf = heap_caps_malloc(w * h * sizeof(uint16_t), MALLOC_CAP_DMA);
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     if (!rect_buf) {
         printf("Failed to allocate rect buffer\n");
         free(img_buf);
@@ -110,12 +116,13 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
                 }
             }
         }
-        esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);
+        esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + w, y + h, rect_buf);        
         vTaskDelay(pdMS_TO_TICKS(speed_ms));
     }
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     free(rect_buf);
     free(img_buf);
-
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
 }
 
 // -------------------- LED blink task --------------------
@@ -175,7 +182,13 @@ static void led_blink_task(void *arg)
 static void draw_bitmap_task(void *arg)
 {
     (void)arg;
-    draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256, 0, 1);
+    while(1) {
+        ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+        draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256, 0, 20);
+        ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+        draw_bitmap_from_spiffs_swap("/spiffs/eel.bmp", 76, 400, 0, 0, 76, 284, 0, 0, 66, 76, 1, 20);
+        ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+    }
     vTaskDelete(NULL);
 }
 
@@ -225,6 +238,7 @@ static void init_st7789(void)
 // -------------------- app_main --------------------
 void app_main(void)
 {
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     // LED GPIOs (main LED + letter LEDs)
     gpio_config_t led_cfg = {
         .pin_bit_mask =
@@ -255,5 +269,5 @@ void app_main(void)
     // Start bitmap drawing task
     xTaskCreate(draw_bitmap_task, "draw_bitmap", 4096, NULL, 2, NULL);
 
-   // xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
+    xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 2, NULL);
 }
