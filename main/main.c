@@ -125,6 +125,43 @@ void draw_bitmap_from_spiffs_swap(const char *path, uint16_t bmp_width, uint16_t
     ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
 }
 
+// Draws a full bitmap from SPIFFS at (x, y) coordinate
+void draw_bitmap_at(const char *path, uint16_t bmp_width, uint16_t bmp_height, uint16_t x, uint16_t y, size_t header_size, uint16_t row_stride) {
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        printf("Failed to open bitmap: %s\n", path);
+        return;
+    }
+    uint16_t *img_buf = heap_caps_malloc(bmp_width * bmp_height * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!img_buf) {
+        printf("Failed to allocate image buffer\n");
+        fclose(f);
+        return;
+    }
+    // Read full image into buffer
+    for (uint16_t row = 0; row < bmp_height; ++row) {
+        size_t offset = header_size + row * row_stride * sizeof(uint16_t);
+        fseek(f, offset, SEEK_SET);
+        size_t read = fread(&img_buf[row * bmp_width], sizeof(uint16_t), bmp_width, f);
+        if (read != bmp_width) {
+            printf("Failed to read row %u\n", row);
+            free(img_buf);
+            fclose(f);
+            return;
+        }
+        // Swap bytes for each pixel
+        for (uint16_t col = 0; col < bmp_width; ++col) {
+            img_buf[row * bmp_width + col] = (img_buf[row * bmp_width + col] >> 8) | (img_buf[row * bmp_width + col] << 8);
+        }
+        vTaskDelay(1);
+    }
+    fclose(f);
+    esp_lcd_panel_draw_bitmap(s_panel_handle, x, y, x + bmp_width, y + bmp_height, img_buf);
+    free(img_buf);
+    ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+}
+
 // -------------------- LED blink task --------------------
 static void led_alternate(){
     for (int i = 0; i < 10; ++i) {
@@ -183,10 +220,16 @@ static void draw_bitmap_task(void *arg)
 {
     (void)arg;
     while(1) {
+        draw_bitmap_at("/spiffs/zanmai.bmp", 76, 76, 0,0, 66, 76);
+        draw_bitmap_from_spiffs_swap("/spiffs/zanmaisu.bmp", 370, 208, 0, 76, 76, 208, 0, 0, 66, 370, 0, 40);
+
+        draw_bitmap_at("/spiffs/sushiro.bmp", 76, 76, 0,LCD_V_RES-76, 66, 76);
+        draw_bitmap_from_spiffs_swap("/spiffs/sushirosu.bmp", 76, 275, 0, 0, 76, 208, 0, 0, 66, 76, 1, 50);
+
         ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
-        draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256, 0, 20);
+        draw_bitmap_from_spiffs_swap("/spiffs/okinomi.bmp", 255, 284, 0, 0, 76, 284, 0, 0, 66, 256, 0, 40);
         ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
-        draw_bitmap_from_spiffs_swap("/spiffs/eel.bmp", 76, 400, 0, 0, 76, 284, 0, 0, 66, 76, 1, 20);
+        draw_bitmap_from_spiffs_swap("/spiffs/eel.bmp", 76, 400, 0, 0, 76, 284, 0, 0, 66, 76, 1, 40);
         ESP_LOGI("MEM", "Free heap: %u bytes, Minimum free heap: %u bytes", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     }
     vTaskDelete(NULL);
@@ -203,7 +246,7 @@ static void init_st7789(void)
         .quadhd_io_num   = -1,
         .max_transfer_sz = LCD_H_RES * 40 * sizeof(uint16_t),
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_DISABLED));
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
