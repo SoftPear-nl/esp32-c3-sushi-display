@@ -29,13 +29,20 @@
 #define PIN_NUM_CS             4   // Super Mini SS
 #define PIN_NUM_DC             2
 #define PIN_NUM_RST            3
-//#define PIN_NUM_LED            8
 
 #define PIN_LETTER_S1       5
 #define PIN_LETTER_U        6
 #define PIN_LETTER_S2       7
 #define PIN_LETTER_H        8
-#define PIN_LETTER_I        9
+#define PIN_LETTER_I        10
+
+enum led_mode_t{
+    LED_MODE_ALL_PATTERNS,
+    LED_MODE_ON,
+    LED_MODE_OFF
+};
+
+enum led_mode_t current_led_mode = LED_MODE_ALL_PATTERNS;
 
 esp_lcd_panel_handle_t s_panel_handle;
 
