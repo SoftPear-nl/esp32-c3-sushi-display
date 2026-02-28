@@ -163,55 +163,203 @@ void draw_bitmap_at(const char *path, uint16_t bmp_width, uint16_t bmp_height, u
 }
 
 // -------------------- LED blink task --------------------
+
+// New: Heartbeat pattern (all on, pulse, all off)
+static void led_heartbeat() {
+    for (int i = 0; i < 3; ++i) {
+        // All on (long)
+        gpio_set_level(PIN_LETTER_S1, 1);
+        gpio_set_level(PIN_LETTER_U, 1);
+        gpio_set_level(PIN_LETTER_S2, 1);
+        gpio_set_level(PIN_LETTER_H, 1);
+        gpio_set_level(PIN_LETTER_I, 1);
+        vTaskDelay(pdMS_TO_TICKS(320));
+        // All off (short)
+        gpio_set_level(PIN_LETTER_S1, 0);
+        gpio_set_level(PIN_LETTER_U, 0);
+        gpio_set_level(PIN_LETTER_S2, 0);
+        gpio_set_level(PIN_LETTER_H, 0);
+        gpio_set_level(PIN_LETTER_I, 0);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        // All on (short)
+        gpio_set_level(PIN_LETTER_S1, 1);
+        gpio_set_level(PIN_LETTER_U, 1);
+        gpio_set_level(PIN_LETTER_S2, 1);
+        gpio_set_level(PIN_LETTER_H, 1);
+        gpio_set_level(PIN_LETTER_I, 1);
+        vTaskDelay(pdMS_TO_TICKS(160));
+        // All off (long)
+        gpio_set_level(PIN_LETTER_S1, 0);
+        gpio_set_level(PIN_LETTER_U, 0);
+        gpio_set_level(PIN_LETTER_S2, 0);
+        gpio_set_level(PIN_LETTER_H, 0);
+        gpio_set_level(PIN_LETTER_I, 0);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+}
+
+// New: Marquee pattern (two lights move together)
+static void led_marquee() {
+    int pins[5] = {PIN_LETTER_S1, PIN_LETTER_U, PIN_LETTER_S2, PIN_LETTER_H, PIN_LETTER_I};
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            for (int k = 0; k < 5; ++k) {
+                gpio_set_level(pins[k], (k==j || k==j+1) ? 1 : 0);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        for (int j = 3; j >= 0; --j) {
+            for (int k = 0; k < 5; ++k) {
+                gpio_set_level(pins[k], (k==j || k==j+1) ? 1 : 0);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+    // All off at end
+    for (int k = 0; k < 5; ++k) gpio_set_level(pins[k], 0);
+}
+
+// New: Random walk (one light moves randomly)
+static void led_random_walk() {
+    int pins[5] = {PIN_LETTER_S1, PIN_LETTER_U, PIN_LETTER_S2, PIN_LETTER_H, PIN_LETTER_I};
+    int pos = rand() % 5;
+    for (int i = 0; i < 16; ++i) {
+        for (int k = 0; k < 5; ++k) gpio_set_level(pins[k], k==pos ? 1 : 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        int dir = rand() % 2 ? 1 : -1;
+        pos += dir;
+        if (pos < 0) pos = 0;
+        if (pos > 4) pos = 4;
+    }
+    for (int k = 0; k < 5; ++k) gpio_set_level(pins[k], 0);
+}
+// Alternate each letter, then reverse
 static void led_alternate(){
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 5; ++i) {
         for (int j = 0; j < 5; ++j) {
             gpio_set_level(PIN_LETTER_S1, j==0 ? 1 : 0);
             gpio_set_level(PIN_LETTER_U, j==1 ? 1 : 0);
             gpio_set_level(PIN_LETTER_S2, j==2 ? 1 : 0);
             gpio_set_level(PIN_LETTER_H, j==3 ? 1 : 0);
             gpio_set_level(PIN_LETTER_I, j==4 ? 1 : 0);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(400));
         }
-    }
-}
-
-static void led_wave(){
-    for (int i = 0; i < 10; ++i) {
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 3; j > 0; --j) {
             gpio_set_level(PIN_LETTER_S1, j==0 ? 1 : 0);
-            gpio_set_level(PIN_LETTER_U, j==1 || j==7 ? 1 : 0);
-            gpio_set_level(PIN_LETTER_S2, j==2 || j==6 ? 1 : 0);
-            gpio_set_level(PIN_LETTER_H, j==3 || j==5 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_U, j==1 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_S2, j==2 ? 1 : 0);
+            gpio_set_level(PIN_LETTER_H, j==3 ? 1 : 0);
             gpio_set_level(PIN_LETTER_I, j==4 ? 1 : 0);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(400));
         }
     }
 }
 
-static void led_full_flicker(){
-    bool on = false;
-    for (int i = 0; i < 10; ++i) {
-        on = !on;
-        for (int j = 0; j < 2; ++j) {
-            gpio_set_level(PIN_LETTER_S1, on);
-            gpio_set_level(PIN_LETTER_U, on);
-            gpio_set_level(PIN_LETTER_S2, on);
-            gpio_set_level(PIN_LETTER_H, on);
-            gpio_set_level(PIN_LETTER_I, on);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+// Wave pattern: lights move outward and inward
+static void led_wave(){
+    int pattern[8][5] = {
+        {1,0,0,0,0},
+        {0,1,0,0,0},
+        {0,0,1,0,0},
+        {0,0,0,1,0},
+        {0,0,0,0,1},
+        {0,0,0,1,0},
+        {0,0,1,0,0},
+        {0,1,0,0,0}
+    };
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            gpio_set_level(PIN_LETTER_S1, pattern[j][0]);
+            gpio_set_level(PIN_LETTER_U,  pattern[j][1]);
+            gpio_set_level(PIN_LETTER_S2, pattern[j][2]);
+            gpio_set_level(PIN_LETTER_H,  pattern[j][3]);
+            gpio_set_level(PIN_LETTER_I,  pattern[j][4]);
+            vTaskDelay(pdMS_TO_TICKS(240));
         }
     }
+}
+
+// All letters flicker rapidly, then slow
+static void led_full_flicker(){
+    for (int i = 0; i < 8; ++i) {
+        gpio_set_level(PIN_LETTER_S1, 1);
+        gpio_set_level(PIN_LETTER_U, 1);
+        gpio_set_level(PIN_LETTER_S2, 1);
+        gpio_set_level(PIN_LETTER_H, 1);
+        gpio_set_level(PIN_LETTER_I, 1);
+        vTaskDelay(pdMS_TO_TICKS(160 + i*60));
+        gpio_set_level(PIN_LETTER_S1, 0);
+        gpio_set_level(PIN_LETTER_U, 0);
+        gpio_set_level(PIN_LETTER_S2, 0);
+        gpio_set_level(PIN_LETTER_H, 0);
+        gpio_set_level(PIN_LETTER_I, 0);
+        vTaskDelay(pdMS_TO_TICKS(160 + i*60));
+    }
+}
+// New: chase pattern (lights up one by one, then all off)
+static void led_chase() {
+    for (int i = 0; i < 3; ++i) {
+        gpio_set_level(PIN_LETTER_S1, 1); vTaskDelay(pdMS_TO_TICKS(160));
+        gpio_set_level(PIN_LETTER_U, 1); vTaskDelay(pdMS_TO_TICKS(160));
+        gpio_set_level(PIN_LETTER_S2, 1); vTaskDelay(pdMS_TO_TICKS(160));
+        gpio_set_level(PIN_LETTER_H, 1); vTaskDelay(pdMS_TO_TICKS(160));
+        gpio_set_level(PIN_LETTER_I, 1); vTaskDelay(pdMS_TO_TICKS(160));
+        gpio_set_level(PIN_LETTER_S1, 0);
+        gpio_set_level(PIN_LETTER_U, 0);
+        gpio_set_level(PIN_LETTER_S2, 0);
+        gpio_set_level(PIN_LETTER_H, 0);
+        gpio_set_level(PIN_LETTER_I, 0);
+        vTaskDelay(pdMS_TO_TICKS(240));
+    }
+}
+
+// New: bounce pattern (lights move back and forth)
+static void led_bounce() {
+    int pins[5] = {PIN_LETTER_S1, PIN_LETTER_U, PIN_LETTER_S2, PIN_LETTER_H, PIN_LETTER_I};
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 5; ++j) {
+            for (int k = 0; k < 5; ++k) gpio_set_level(pins[k], k==j ? 1 : 0);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        for (int j = 3; j > 0; --j) {
+            for (int k = 0; k < 5; ++k) gpio_set_level(pins[k], k==j ? 1 : 0);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+}
+
+// New: sparkle pattern (randomly flicker letters)
+#include <stdlib.h>
+static void led_sparkle() {
+    for (int i = 0; i < 20; ++i) {
+        gpio_set_level(PIN_LETTER_S1, rand()%2);
+        gpio_set_level(PIN_LETTER_U, rand()%2);
+        gpio_set_level(PIN_LETTER_S2, rand()%2);
+        gpio_set_level(PIN_LETTER_H, rand()%2);
+        gpio_set_level(PIN_LETTER_I, rand()%2);
+        vTaskDelay(pdMS_TO_TICKS(160));
+    }
+    // All off at end
+    gpio_set_level(PIN_LETTER_S1, 0);
+    gpio_set_level(PIN_LETTER_U, 0);
+    gpio_set_level(PIN_LETTER_S2, 0);
+    gpio_set_level(PIN_LETTER_H, 0);
+    gpio_set_level(PIN_LETTER_I, 0);
 }
 
 static void led_blink_task(void *arg)
 {
     (void)arg;
-
     while (1) {
         led_alternate();
         led_wave();
         led_full_flicker();
+        led_chase();
+        led_bounce();
+        led_sparkle();
+        led_heartbeat();
+        led_marquee();
+        led_random_walk();
     }
 }
 
