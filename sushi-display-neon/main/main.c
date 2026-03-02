@@ -49,8 +49,6 @@ enum led_mode_t current_led_mode = LED_MODE_ALL_PATTERNS;
 
 esp_lcd_panel_handle_t s_panel_handle;
 
-
-
 // -------------------- LED blink task --------------------
 
 // New: Heartbeat pattern (all on, pulse, all off)
@@ -253,6 +251,11 @@ static void led_blink_task(void *arg)
 
 // -------------------- BMP display functions --------------------
 
+/* Static pixel buffer: allocated once at startup to avoid heap fragmentation.
+   Sized for the largest BMP file used in this project (220 KB). */
+#define BMP_PIXEL_BUF_SIZE (240u * 1024u)
+static uint8_t s_pixel_buf[BMP_PIXEL_BUF_SIZE];
+
 /* Direction for display_bitmap_pan() */
 typedef enum {
     PAN_LEFT_TO_RIGHT,
@@ -322,26 +325,26 @@ static esp_err_t bmp_read_info(FILE *f, bmp_info_t *out)
     return ESP_OK;
 }
 
-/* Internal: load all pixel data from an already-open BMP file into a
-   heap-allocated buffer. The caller must free() the returned pointer.
-   Returns NULL on allocation or read failure. */
-static uint8_t *bmp_load_pixels(FILE *f, const bmp_info_t *bmp)
+/* Internal: load all pixel data from an already-open BMP file into the
+   supplied buffer.  Uses the static s_pixel_buf — no heap allocation.
+   Returns ESP_OK on success. */
+static esp_err_t bmp_load_pixels(FILE *f, const bmp_info_t *bmp,
+                                  uint8_t *buf, size_t buf_size)
 {
     size_t data_size = (size_t)bmp->height * bmp->row_stride;
-    uint8_t *pixels = malloc(data_size);
-    ESP_LOGI("BMP", "memory free: %u bytes, loading %u bytes for pixel data",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)data_size);
-    if (!pixels) {
-        ESP_LOGE("BMP", "Cannot allocate %u bytes for pixel data", (unsigned)data_size);
-        return NULL;
+    ESP_LOGI("BMP", "static buf: %u bytes, loading %u bytes for pixel data. free mem: %u bytes",
+             (unsigned)buf_size, (unsigned)data_size, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    if (data_size > buf_size) {
+        ESP_LOGE("BMP", "Pixel data %u bytes exceeds static buffer %u bytes",
+                 (unsigned)data_size, (unsigned)buf_size);
+        return ESP_ERR_NO_MEM;
     }
     fseek(f, (long)bmp->pixel_offset, SEEK_SET);
-    if (fread(pixels, 1, data_size, f) != data_size) {
+    if (fread(buf, 1, data_size, f) != data_size) {
         ESP_LOGE("BMP", "Short read of pixel data");
-        free(pixels);
-        return NULL;
+        return ESP_ERR_INVALID_SIZE;
     }
-    return pixels;
+    return ESP_OK;
 }
 
 /* Internal: draw the visible portion of a BMP from a RAM pixel buffer placed
@@ -422,15 +425,13 @@ esp_err_t display_bitmap(const char *path, int x, int y)
     esp_err_t err = bmp_read_info(f, &bmp);
     if (err != ESP_OK) { fclose(f); return err; }
 
-    /* Load all pixel data into RAM, then close the file immediately so
-       SPIFFS flash is no longer accessed during the draw. */
-    uint8_t *pixels = bmp_load_pixels(f, &bmp);
+    /* Load all pixel data into the static RAM buffer, then close the file
+       immediately so SPIFFS flash is no longer accessed during the draw. */
+    err = bmp_load_pixels(f, &bmp, s_pixel_buf, sizeof(s_pixel_buf));
     fclose(f);
-    if (!pixels) return ESP_ERR_NO_MEM;
+    if (err != ESP_OK) return err;
 
-    err = bmp_draw_clipped(&bmp, pixels, x, y, 0, 0, LCD_H_RES, LCD_V_RES);
-    free(pixels);
-    return err;
+    return bmp_draw_clipped(&bmp, s_pixel_buf, x, y, 0, 0, LCD_H_RES, LCD_V_RES);
 }
 
 /**
@@ -469,11 +470,13 @@ esp_err_t display_bitmap_pan(const char *path, pan_direction_t direction,
     esp_err_t err = bmp_read_info(f, &bmp);
     if (err != ESP_OK) { fclose(f); return err; }
 
-    /* Load all pixel data into RAM then close the file immediately.
-       All animation frames draw from RAM — no SPIFFS access in the loop. */
-    uint8_t *pixels = bmp_load_pixels(f, &bmp);
+    /* Load all pixel data into the static RAM buffer then close the file
+       immediately.  All animation frames draw from RAM — no SPIFFS access
+       in the loop. */
+    err = bmp_load_pixels(f, &bmp, s_pixel_buf, sizeof(s_pixel_buf));
     fclose(f);
-    if (!pixels) return ESP_ERR_NO_MEM;
+    if (err != ESP_OK) return err;
+    uint8_t *pixels = s_pixel_buf;
 
     /* Maximum scroll offsets relative to the window size */
     int max_ox = bmp.width  > win_w ? bmp.width  - win_w : 0;
@@ -515,7 +518,6 @@ esp_err_t display_bitmap_pan(const char *path, pan_direction_t direction,
         if (direction == PAN_BOTTOM_TO_TOP && oy <= 0)      break;
     }
 
-    free(pixels);
     return ESP_OK;
 }
 
@@ -527,22 +529,14 @@ static void draw_bitmap_task(void *arg)
         /* --- Static display --- */
         display_bitmap("/spiffs/sushiro.bmp", 0, 0);
         display_bitmap_pan("/spiffs/sushirosu.bmp", PAN_BOTTOM_TO_TOP, 0, 76, LCD_H_RES, LCD_V_RES-76, 1, 10);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+
         display_bitmap("/spiffs/zanmai.bmp", 0, LCD_V_RES - 76);
         display_bitmap_pan("/spiffs/eel.bmp", PAN_TOP_TO_BOTTOM, 0, 0, LCD_H_RES, LCD_V_RES-76, 1, 10);
-        vTaskDelay(pdMS_TO_TICKS(2000));
 
-        /* --- Panning (full display window) --- */
-        /* Tall image scrolls top-to-bottom across full display */
-        
-        /* Tall image scrolls bottom-to-top across full display */
-        
-        /* Wide image pans right-to-left in top half of display */
-        display_bitmap_pan("/spiffs/okinomi.bmp",   PAN_RIGHT_TO_LEFT,
-                           0, 0, LCD_H_RES, LCD_V_RES, 1, 10);
-        /* Wide image pans left-to-right in bottom half of display */
-        display_bitmap_pan("/spiffs/zanmaisu.bmp",  PAN_LEFT_TO_RIGHT,
-                           0, 0, LCD_H_RES, LCD_V_RES, 1, 10);
+
+        display_bitmap_pan("/spiffs/okinomi.bmp",   PAN_RIGHT_TO_LEFT, 0, 0, LCD_H_RES, LCD_V_RES, 1, 10);
+
+        display_bitmap_pan("/spiffs/zanmaisu.bmp",  PAN_LEFT_TO_RIGHT, 0, 0, LCD_H_RES, LCD_V_RES, 1, 10);
     }
     vTaskDelete(NULL);
 }
