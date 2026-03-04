@@ -85,7 +85,7 @@ static void gc9a01_run_init_sequence(void)
     send_byte(0x00);
     send_byte(0x20);
 
-    send_cmd(0x36); send_byte(0x48);   // MADCTL  – BGR bit set
+    send_cmd(0x36); send_byte(0x08);   // MADCTL  – BGR bit set, no mirroring
 
     send_cmd(0x3A); send_byte(0x05);   // COLMOD  – RGB565
 
