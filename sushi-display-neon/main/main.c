@@ -45,9 +45,12 @@ esp_lcd_panel_handle_t s_panel_handle;
 
 // -------------------- BMP display functions --------------------
 
-/* Static pixel buffer: allocated once at startup to avoid heap fragmentation.
-   Sized for the largest BMP file used in this project (220 KB). */
-#define BMP_PIXEL_BUF_SIZE (240u * 1024u)
+/* Static pixel buffer: holds raw pixel data loaded from SPIFFS.
+   Must fit the largest image's pixel data (~154 KB for zanmaisu.bmp).
+   The draw buffer is allocated from heap at call time, which is safe because
+   reducing this buffer from 240 KB frees enough heap for even a full-screen
+   draw buffer (170 x 320 x 2 = ~106 KB). */
+#define BMP_PIXEL_BUF_SIZE (170u * 1024u)
 static uint8_t s_pixel_buf[BMP_PIXEL_BUF_SIZE];
 
 /* Direction for display_bitmap_pan() */
@@ -148,7 +151,8 @@ static esp_err_t bmp_load_pixels(FILE *f, const bmp_info_t *bmp,
    full-screen draw. No SPIFFS/flash access occurs here. */
 static esp_err_t bmp_draw_clipped(const bmp_info_t *bmp, const uint8_t *pixels,
                                    int img_x, int img_y,
-                                   int clip_x1, int clip_y1, int clip_x2, int clip_y2)
+                                   int clip_x1, int clip_y1, int clip_x2, int clip_y2,
+                                   uint16_t *ext_buf)
 {
     /* Clamp clip rect to display bounds */
     if (clip_x1 < 0)         clip_x1 = 0;
@@ -168,8 +172,12 @@ static esp_err_t bmp_draw_clipped(const bmp_info_t *bmp, const uint8_t *pixels,
     int vis_w   = vis_x2 - vis_x1;
     int vis_h   = vis_y2 - vis_y1;
 
-    uint16_t *buf = malloc((size_t)vis_w * vis_h * sizeof(uint16_t));
-    if (!buf) return ESP_ERR_NO_MEM;
+    uint16_t *draw_buf = ext_buf ? ext_buf : malloc((size_t)vis_w * vis_h * sizeof(uint16_t));
+    if (!draw_buf) {
+        ESP_LOGE("BMP", "draw buffer alloc failed (%u bytes)",
+                 (unsigned)((size_t)vis_w * vis_h * sizeof(uint16_t)));
+        return ESP_ERR_NO_MEM;
+    }
 
     for (int r = 0; r < vis_h; r++) {
         int bmp_row = src_row + r;
@@ -178,19 +186,18 @@ static esp_err_t bmp_draw_clipped(const bmp_info_t *bmp, const uint8_t *pixels,
         }
         const uint16_t *src_row_ptr = (const uint16_t *)(
             pixels + (size_t)bmp_row * bmp->row_stride + (size_t)src_col * 2);
-        uint16_t *dst_row_ptr = &buf[(size_t)r * vis_w];
+        uint16_t *dst_row_ptr = &draw_buf[(size_t)r * vis_w];
         for (int c = 0; c < vis_w; c++) {
             uint16_t v = src_row_ptr[c];
             /* BMP is little-endian; esp_lcd with LCD_RGB_DATA_ENDIAN_BIG needs
                big-endian, so byte-swap each pixel. */
             dst_row_ptr[c] = (uint16_t)((v << 8) | (v >> 8));
         }
-        /* Yield periodically so IDLE can reset the watchdog */
         if ((r & 15) == 15) taskYIELD();
     }
 
-    esp_lcd_panel_draw_bitmap(s_panel_handle, vis_x1, vis_y1, vis_x2, vis_y2, buf);
-    free(buf);
+    esp_lcd_panel_draw_bitmap(s_panel_handle, vis_x1, vis_y1, vis_x2, vis_y2, draw_buf);
+    if (!ext_buf) free(draw_buf);
     return ESP_OK;
 }
 
@@ -225,7 +232,7 @@ esp_err_t display_bitmap(const char *path, int x, int y)
     fclose(f);
     if (err != ESP_OK) return err;
 
-    return bmp_draw_clipped(&bmp, s_pixel_buf, x, y, 0, 0, LCD_H_RES, LCD_V_RES);
+    return bmp_draw_clipped(&bmp, s_pixel_buf, x, y, 0, 0, LCD_H_RES, LCD_V_RES, NULL);
 }
 
 /**
@@ -255,21 +262,31 @@ esp_err_t display_bitmap_pan(const char *path, pan_direction_t direction,
     if (win_w   <= 0) win_w   = LCD_H_RES;
     if (win_h   <= 0) win_h   = LCD_V_RES;
 
+    /* Allocate the frame draw buffer FIRST, before loading pixel data, to
+       guarantee the heap has a large contiguous block available. */
+    uint16_t *draw_buf = malloc((size_t)win_w * win_h * sizeof(uint16_t));
+    if (!draw_buf) {
+        ESP_LOGE("BMP", "pan draw buffer alloc failed (%u bytes)",
+                 (unsigned)((size_t)win_w * win_h * sizeof(uint16_t)));
+        return ESP_ERR_NO_MEM;
+    }
+
     FILE *f = fopen(path, "rb");
     if (!f) {
         ESP_LOGE("BMP", "Cannot open: %s", path);
+        free(draw_buf);
         return ESP_ERR_NOT_FOUND;
     }
     bmp_info_t bmp;
     esp_err_t err = bmp_read_info(f, &bmp);
-    if (err != ESP_OK) { fclose(f); return err; }
+    if (err != ESP_OK) { fclose(f); free(draw_buf); return err; }
 
     /* Load all pixel data into the static RAM buffer then close the file
-       immediately.  All animation frames draw from RAM â€” no SPIFFS access
+       immediately.  All animation frames draw from RAM — no SPIFFS access
        in the loop. */
     err = bmp_load_pixels(f, &bmp, s_pixel_buf, sizeof(s_pixel_buf));
     fclose(f);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { free(draw_buf); return err; }
     uint8_t *pixels = s_pixel_buf;
 
     /* Maximum scroll offsets relative to the window size */
@@ -285,13 +302,10 @@ esp_err_t display_bitmap_pan(const char *path, pan_direction_t direction,
         case PAN_BOTTOM_TO_TOP:  oy = max_oy;  break;
     }
 
-    /* Clear only the window before starting */
-    lcd_fill_rect(win_x, win_y, win_x + win_w, win_y + win_h, 0x0000);
-
     /* Image top-left is placed at (win_x - ox, win_y - oy) so that image
        pixel (ox, oy) lands exactly at window corner (win_x, win_y). */
     bmp_draw_clipped(&bmp, pixels, win_x - ox, win_y - oy,
-                     win_x, win_y, win_x + win_w, win_y + win_h);
+                     win_x, win_y, win_x + win_w, win_y + win_h, draw_buf);
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(delay_ms > 0 ? delay_ms : 1));
@@ -304,7 +318,7 @@ esp_err_t display_bitmap_pan(const char *path, pan_direction_t direction,
         }
 
         bmp_draw_clipped(&bmp, pixels, win_x - ox, win_y - oy,
-                         win_x, win_y, win_x + win_w, win_y + win_h);
+                         win_x, win_y, win_x + win_w, win_y + win_h, draw_buf);
 
         if (direction == PAN_LEFT_TO_RIGHT && ox >= max_ox) break;
         if (direction == PAN_RIGHT_TO_LEFT && ox <= 0)      break;
@@ -312,6 +326,7 @@ esp_err_t display_bitmap_pan(const char *path, pan_direction_t direction,
         if (direction == PAN_BOTTOM_TO_TOP && oy <= 0)      break;
     }
 
+    free(draw_buf);
     return ESP_OK;
 }
 
@@ -320,17 +335,22 @@ static void draw_bitmap_task(void *arg)
 {
     (void)arg;
     while (1) {
-        /* --- Static display --- */
-        display_bitmap("/spiffs/sushiro.bmp", 0, 0);
-        display_bitmap_pan("/spiffs/sushirosu.bmp", PAN_BOTTOM_TO_TOP, 0, 76, LCD_H_RES, LCD_V_RES-76, 1, 10);
-
-        display_bitmap("/spiffs/zanmai.bmp", 0, LCD_V_RES - 76);
-        display_bitmap_pan("/spiffs/eel.bmp", PAN_TOP_TO_BOTTOM, 0, 0, LCD_H_RES, LCD_V_RES-76, 1, 10);
-
-
         display_bitmap_pan("/spiffs/okinomi.bmp",   PAN_RIGHT_TO_LEFT, 0, 0, LCD_H_RES, LCD_V_RES, 1, 10);
 
-        display_bitmap_pan("/spiffs/zanmaisu.bmp",  PAN_LEFT_TO_RIGHT, 0, 0, LCD_H_RES, LCD_V_RES, 1, 10);
+        display_bitmap("/spiffs/pommes.bmp", 0, LCD_V_RES-53);
+        display_bitmap_pan("/spiffs/pommesomel.bmp",  PAN_LEFT_TO_RIGHT, 0, 0, LCD_H_RES, LCD_V_RES-53, 1, 10);
+
+        display_bitmap("/spiffs/sushiro.bmp", 0, 0);
+        display_bitmap_pan("/spiffs/sushirosu.bmp", PAN_BOTTOM_TO_TOP, 0, 100, LCD_H_RES, LCD_V_RES-100, 1, 10);
+
+        display_bitmap("/spiffs/zanmai.bmp", 0, LCD_V_RES - 112);
+        display_bitmap_pan("/spiffs/zanmaisu.bmp",  PAN_LEFT_TO_RIGHT, 0, 0, LCD_H_RES, LCD_V_RES-112, 1, 10);
+
+       
+
+        
+
+        
     }
     vTaskDelete(NULL);
 }
