@@ -18,7 +18,9 @@
 #include "neon_letter_service.h"
 
 // -------------------- Display config --------------------
-#define LCD_HOST               SPI2_HOST
+// ESP32-S3 N16R8: two independent SPI buses, one per screen
+#define LCD_HOST               SPI2_HOST   // Screen 1
+#define LCD_HOST2              SPI3_HOST   // Screen 2
 
 #define LCD_H_RES              240
 #define LCD_V_RES              320
@@ -28,18 +30,25 @@
 // Panel color order: set to 1 for RGB, 0 for BGR
 #define PANEL_COLOR_ORDER_RGB  1
 
-#define PIN_NUM_MOSI           0   // Super Mini MOSI
-#define PIN_NUM_SCLK           1   // Super Mini SCK
-#define PIN_NUM_CS             4   // Super Mini SS
-#define PIN_NUM_DC             2
-#define PIN_NUM_RST            3
-#define PIN_NUM_CS2            20
+// Screen 1 — SPI2
+#define PIN_NUM_MOSI           11
+#define PIN_NUM_SCLK           12
+#define PIN_NUM_CS             10
+#define PIN_NUM_DC             13
+#define PIN_NUM_RST            14
 
-#define PIN_LETTER_S1       5 
-#define PIN_LETTER_U        6
-#define PIN_LETTER_S2       7
-#define PIN_LETTER_H        8
-#define PIN_LETTER_I        10
+// Screen 2 — SPI3 (independent bus: runs in parallel with SPI2)
+#define PIN_NUM_MOSI2          5
+#define PIN_NUM_SCLK2          6
+#define PIN_NUM_CS2            7
+#define PIN_NUM_DC2            8
+#define PIN_NUM_RST2           9
+
+#define PIN_LETTER_S1       15
+#define PIN_LETTER_U        16
+#define PIN_LETTER_S2       17
+#define PIN_LETTER_H        18
+#define PIN_LETTER_I        21
 
 esp_lcd_panel_handle_t s_panel_handle;
 esp_lcd_panel_handle_t s_panel_handle2;
@@ -104,10 +113,11 @@ static esp_err_t bmp_draw_direct(esp_lcd_panel_handle_t panel, FILE *f,
     int vis_h   = vis_y2 - vis_y1;
     int src_col = vis_x1 - x;
 
-    uint16_t *buf = malloc((size_t)vis_w * (size_t)vis_h * sizeof(uint16_t));
+    size_t buf_bytes = (size_t)vis_w * (size_t)vis_h * sizeof(uint16_t);
+    uint16_t *buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(buf_bytes);  // fallback to internal RAM
     if (!buf) {
-        ESP_LOGE("BMP", "alloc failed (%u bytes)",
-                 (unsigned)((size_t)vis_w * vis_h * sizeof(uint16_t)));
+        ESP_LOGE("BMP", "alloc failed (%u bytes)", (unsigned)buf_bytes);
         return ESP_ERR_NO_MEM;
     }
 
@@ -140,88 +150,239 @@ esp_err_t display_bitmap(esp_lcd_panel_handle_t panel, const char *path, int x, 
     return err;
 }
 
-// -------------------- Bitmap draw task --------------------
-static void draw_bitmap_task(void *arg)
+/* In-memory BMP: pixels stored top-down, width*height uint16_t, already byte-swapped.
+   Loaded entirely from SPIFFS into SPIRAM once so animation frames never touch
+   the filesystem — safe for concurrent access from multiple cores. */
+typedef struct {
+    bmp_info_t  info;
+    uint16_t   *pixels;   /* full image in SPIRAM, top-down, no row padding */
+    uint16_t   *clip_buf; /* screen-sized scratch buffer for clipped draws, SPIRAM */
+} bmp_buf_t;
+
+static esp_err_t bmp_buf_load(const char *path, bmp_buf_t *out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { ESP_LOGE("BMP", "Cannot open: %s", path); return ESP_ERR_NOT_FOUND; }
+    esp_err_t err = bmp_read_info(f, &out->info);
+    if (err != ESP_OK) { fclose(f); return err; }
+
+    size_t total = (size_t)out->info.width * (size_t)out->info.height * sizeof(uint16_t);
+    out->pixels = heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out->pixels) out->pixels = malloc(total);
+    if (!out->pixels) { fclose(f); return ESP_ERR_NO_MEM; }
+
+    /* Pre-allocate a screen-sized scratch buffer used by bmp_draw_buf so that
+       no heap allocation is needed per frame during animation. */
+    size_t clip_sz = (size_t)LCD_H_RES * (size_t)LCD_V_RES * sizeof(uint16_t);
+    out->clip_buf = heap_caps_malloc(clip_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out->clip_buf) out->clip_buf = malloc(clip_sz);
+    if (!out->clip_buf) { free(out->pixels); fclose(f); return ESP_ERR_NO_MEM; }
+
+    for (int row = 0; row < out->info.height; row++) {
+        int bmp_row = out->info.top_down ? row : (out->info.height - 1 - row);
+        fseek(f, (long)out->info.pixel_offset + (long)bmp_row * (long)out->info.row_stride, SEEK_SET);
+        uint16_t *dst = out->pixels + (size_t)row * (size_t)out->info.width;
+        fread(dst, sizeof(uint16_t), (size_t)out->info.width, f);
+        for (int c = 0; c < out->info.width; c++) {
+            uint16_t v = dst[c];
+            dst[c] = (uint16_t)((v << 8) | (v >> 8));
+        }
+    }
+    fclose(f);
+    return ESP_OK;
+}
+
+static void bmp_buf_free(bmp_buf_t *bmp)
+{
+    free(bmp->pixels);
+    free(bmp->clip_buf);
+    bmp->pixels   = NULL;
+    bmp->clip_buf = NULL;
+}
+
+/* Draw from in-memory buffer at (x, y), clipped to screen.
+   If rows are contiguous in the buffer the data is sent directly;
+   otherwise a temporary strip buffer is used for the clipped case. */
+static void bmp_draw_buf(esp_lcd_panel_handle_t panel, const bmp_buf_t *bmp, int x, int y)
+{
+    int vis_x1 = x < 0 ? 0 : x;
+    int vis_y1 = y < 0 ? 0 : y;
+    int vis_x2 = (x + bmp->info.width)  > LCD_H_RES ? LCD_H_RES : (x + bmp->info.width);
+    int vis_y2 = (y + bmp->info.height) > LCD_V_RES ? LCD_V_RES : (y + bmp->info.height);
+    if (vis_x1 >= vis_x2 || vis_y1 >= vis_y2) return;
+
+    int vis_w = vis_x2 - vis_x1;
+    int vis_h = vis_y2 - vis_y1;
+    int src_x = vis_x1 - x;
+    int src_y = vis_y1 - y;
+
+    if (src_x == 0 && vis_w == bmp->info.width && vis_h == bmp->info.height) {
+        /* Entire image fits on screen with no horizontal clipping — copy to
+           clip_buf first so the DMA source is guaranteed to be a contiguous
+           internal/SPIRAM block rather than an arbitrary SPIRAM offset. */
+        size_t total = (size_t)vis_w * (size_t)vis_h * sizeof(uint16_t);
+        uint16_t *row0 = bmp->pixels + (size_t)src_y * (size_t)bmp->info.width;
+        memcpy(bmp->clip_buf, row0, total);
+        esp_lcd_panel_draw_bitmap(panel, vis_x1, vis_y1, vis_x2, vis_y2, bmp->clip_buf);
+        return;
+    }
+
+    /* Clipped / panned case: pack visible columns into the pre-allocated
+       clip_buf — no heap allocation per frame. */
+    size_t row_bytes = (size_t)vis_w * sizeof(uint16_t);
+    for (int r = 0; r < vis_h; r++) {
+        uint16_t *src = bmp->pixels + (size_t)(src_y + r) * (size_t)bmp->info.width + src_x;
+        memcpy(bmp->clip_buf + (size_t)r * vis_w, src, row_bytes);
+    }
+    esp_lcd_panel_draw_bitmap(panel, vis_x1, vis_y1, vis_x2, vis_y2, bmp->clip_buf);
+}
+
+/* Fill a rectangular screen region with black (0x0000). Uses a 16-row chunk
+   buffer so no large allocation is needed even for full-screen fills. */
+static void fill_rect_black(esp_lcd_panel_handle_t panel, int x1, int y1, int x2, int y2)
+{
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 > LCD_H_RES) x2 = LCD_H_RES;
+    if (y2 > LCD_V_RES) y2 = LCD_V_RES;
+    if (x1 >= x2 || y1 >= y2) return;
+    int w = x2 - x1;
+    const int CHUNK = 16;
+    uint16_t *buf = malloc((size_t)w * CHUNK * sizeof(uint16_t));
+    if (!buf) return;
+    memset(buf, 0, (size_t)w * CHUNK * sizeof(uint16_t));
+    for (int y = y1; y < y2; y += CHUNK) {
+        int rows = (y + CHUNK <= y2) ? CHUNK : (y2 - y);
+        esp_lcd_panel_draw_bitmap(panel, x1, y, x2, y + rows, buf);
+    }
+    free(buf);
+}
+
+/* Display a BMP with animation for duration_ms milliseconds.
+ *
+ * If the image is larger than the screen in any dimension:
+ *   Pan — scrolls the viewport from (0,0) to the far corner and back,
+ *   clamped to the image boundaries.
+ *
+ * If the image fits entirely on screen:
+ *   Bounce — the image floats on a black background, bouncing off the
+ *   screen edges. */
+void pan_or_bounce_bitmap(esp_lcd_panel_handle_t panel, const char *path, uint32_t duration_ms)
+{
+    /* Load the entire image into SPIRAM once. After this point no SPIFFS
+       access occurs, so both tasks can run concurrently on separate cores
+       without any filesystem contention. */
+    bmp_buf_t bmp = {0};
+    if (bmp_buf_load(path, &bmp) != ESP_OK) return;
+
+    const uint32_t FRAME_MS = 50;   /* ~20 fps */
+    int total_frames = (int)(duration_ms / FRAME_MS);
+    if (total_frames < 1) total_frames = 1;
+
+    int max_pan_x = (bmp.info.width  > LCD_H_RES) ? (bmp.info.width  - LCD_H_RES) : 0;
+    int max_pan_y = (bmp.info.height > LCD_V_RES) ? (bmp.info.height - LCD_V_RES) : 0;
+
+    if (max_pan_x > 0 || max_pan_y > 0) {
+        /* --- Pan mode: triangle-wave sweep across the image --- */
+        for (int frame = 0; frame < total_frames; frame++) {
+            float t    = (total_frames > 1) ? (float)frame / (float)(total_frames - 1) : 0.0f;
+            float ping = (t < 0.5f) ? (t * 2.0f) : (2.0f - t * 2.0f);
+            bmp_draw_buf(panel, &bmp,
+                         -(int)(ping * (float)max_pan_x),
+                         -(int)(ping * (float)max_pan_y));
+            vTaskDelay(pdMS_TO_TICKS(FRAME_MS));
+        }
+    } else {
+        /* --- Bounce mode: image floats on black, bounces off screen edges --- */
+        float pos_x = (float)(LCD_H_RES - bmp.info.width)  / 2.0f;
+        float pos_y = (float)(LCD_V_RES - bmp.info.height) / 2.0f;
+        float vel_x = 2.0f;
+        float vel_y = 1.5f;
+        int   prev_x = -1, prev_y = -1;
+
+        fill_rect_black(panel, 0, 0, LCD_H_RES, LCD_V_RES);
+
+        for (int frame = 0; frame < total_frames; frame++) {
+            int cur_x = (int)pos_x;
+            int cur_y = (int)pos_y;
+
+            bmp_draw_buf(panel, &bmp, cur_x, cur_y);
+
+            if (prev_x >= 0) {
+                int dx = cur_x - prev_x;
+                int dy = cur_y - prev_y;
+                if (dx > 0)
+                    fill_rect_black(panel, prev_x, prev_y,
+                                    prev_x + dx, prev_y + bmp.info.height);
+                else if (dx < 0)
+                    fill_rect_black(panel, cur_x + bmp.info.width, prev_y,
+                                    prev_x + bmp.info.width, prev_y + bmp.info.height);
+                if (dy > 0)
+                    fill_rect_black(panel, prev_x, prev_y,
+                                    prev_x + bmp.info.width, prev_y + dy);
+                else if (dy < 0)
+                    fill_rect_black(panel, prev_x, cur_y + bmp.info.height,
+                                    prev_x + bmp.info.width, prev_y + bmp.info.height);
+            }
+
+            prev_x = cur_x;
+            prev_y = cur_y;
+
+            pos_x += vel_x;
+            pos_y += vel_y;
+
+            if (pos_x < 0.0f)                                                      { pos_x = 0.0f;                                  if (vel_x < 0.0f) vel_x = -vel_x; }
+            if (pos_y < 0.0f)                                                      { pos_y = 0.0f;                                  if (vel_y < 0.0f) vel_y = -vel_y; }
+            if (pos_x + (float)bmp.info.width  > (float)LCD_H_RES) { pos_x = (float)(LCD_H_RES - bmp.info.width);  if (vel_x > 0.0f) vel_x = -vel_x; }
+            if (pos_y + (float)bmp.info.height > (float)LCD_V_RES) { pos_y = (float)(LCD_V_RES - bmp.info.height); if (vel_y > 0.0f) vel_y = -vel_y; }
+
+            vTaskDelay(pdMS_TO_TICKS(FRAME_MS));
+        }
+    }
+
+    bmp_buf_free(&bmp);
+}
+
+// -------------------- Bitmap draw tasks (one per screen, one per core) --------------------
+static void draw_bitmap_task1(void *arg)
 {
     (void)arg;
     while (1) {
-        // Screen 1
-        display_bitmap(s_panel_handle,  "/spiffs/sushiro.bmp", 0, 0);
-        // Screen 2
-        display_bitmap(s_panel_handle2, "/spiffs/zanmai.bmp",  0, 0);
-
-        vTaskDelay(pdMS_TO_TICKS(5000));
-
-        // Screen 1
-        display_bitmap(s_panel_handle,  "/spiffs/okinomi.bmp", 0, 0);
-        // Screen 2
-        display_bitmap(s_panel_handle2, "/spiffs/pommes.bmp",  0, 0);
-
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        pan_or_bounce_bitmap(s_panel_handle, "/spiffs/sushiro.bmp", 5000);
+        pan_or_bounce_bitmap(s_panel_handle, "/spiffs/okinomi.bmp", 5000);
     }
     vTaskDelete(NULL);
 }
 
-// -------------------- ST7789 init --------------------
-static void init_st7789(void)
+static void draw_bitmap_task2(void *arg)
 {
-    spi_bus_config_t buscfg = {
-        .sclk_io_num     = PIN_NUM_SCLK,
-        .mosi_io_num     = PIN_NUM_MOSI,
+    // Initialise SPI3 and panel 2 HERE, running on core 1, so the SPI ISR is
+    // bound to core 1 and draw_bitmap calls never block waiting for a
+    // core-0 interrupt.
+    spi_bus_config_t buscfg2 = {
+        .sclk_io_num     = PIN_NUM_SCLK2,
+        .mosi_io_num     = PIN_NUM_MOSI2,
         .miso_io_num     = -1,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = LCD_H_RES * 40 * sizeof(uint16_t),
+        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST2, &buscfg2, SPI_DMA_CH_AUTO));
 
-    esp_lcd_panel_io_handle_t io_handle = NULL;
-    esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num       = PIN_NUM_DC,
-        .cs_gpio_num       = PIN_NUM_CS,
-        .pclk_hz           = 10 * 1000 * 1000, // 10 MHz
-        .lcd_cmd_bits      = 8,
-        .lcd_param_bits    = 8,
-        .spi_mode          = 0,
-        .trans_queue_depth = 10,
-    };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
-
-    esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_NUM_RST,
-        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR,
-        .bits_per_pixel = 16,
-        .rgb_endian     = LCD_RGB_DATA_ENDIAN_BIG // 16-bit color data sent as low byte first
-        
-    };
-
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel_handle));
-
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel_handle, LCD_X_OFFSET, LCD_Y_OFFSET));
-
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel_handle, true, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel_handle, true));
-
-    // Second panel on the same SPI bus — only needs a separate CS pin.
-    // RST is shared with panel 0, so use software reset (reset_gpio_num = -1)
-    // to avoid re-resetting the already-initialised first panel.
     esp_lcd_panel_io_handle_t io_handle2 = NULL;
     esp_lcd_panel_io_spi_config_t io_config2 = {
-        .dc_gpio_num       = PIN_NUM_DC,
+        .dc_gpio_num       = PIN_NUM_DC2,
         .cs_gpio_num       = PIN_NUM_CS2,
-        .pclk_hz           = 10 * 1000 * 1000,
+        .pclk_hz           = 40 * 1000 * 1000,
         .lcd_cmd_bits      = 8,
         .lcd_param_bits    = 8,
         .spi_mode          = 0,
         .trans_queue_depth = 10,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config2, &io_handle2));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST2, &io_config2, &io_handle2));
 
     esp_lcd_panel_dev_config_t panel_config2 = {
-        .reset_gpio_num = -1,  // software reset; RST pin is shared with panel 0
+        .reset_gpio_num = PIN_NUM_RST2,
         .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
         .rgb_endian     = LCD_RGB_DATA_ENDIAN_BIG,
@@ -234,6 +395,56 @@ static void init_st7789(void)
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel_handle2, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel_handle2, true));
 
+    // Signal app_main that panel 2 is ready
+    SemaphoreHandle_t ready = (SemaphoreHandle_t)arg;
+    xSemaphoreGive(ready);
+
+    while (1) {
+        pan_or_bounce_bitmap(s_panel_handle2, "/spiffs/zanmai.bmp", 5000);
+        pan_or_bounce_bitmap(s_panel_handle2, "/spiffs/pommes.bmp", 5000);
+    }
+    vTaskDelete(NULL);
+}
+
+// -------------------- ST7789 init (screen 1 only — screen 2 is init'd from core 1) --------------------
+static void init_st7789(void)
+{
+    // ---- SPI2: Screen 1 ----
+    spi_bus_config_t buscfg1 = {
+        .sclk_io_num     = PIN_NUM_SCLK,
+        .mosi_io_num     = PIN_NUM_MOSI,
+        .miso_io_num     = -1,
+        .quadwp_io_num   = -1,
+        .quadhd_io_num   = -1,
+        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg1, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num       = PIN_NUM_DC,
+        .cs_gpio_num       = PIN_NUM_CS,
+        .pclk_hz           = 40 * 1000 * 1000, // 40 MHz
+        .lcd_cmd_bits      = 8,
+        .lcd_param_bits    = 8,
+        .spi_mode          = 0,
+        .trans_queue_depth = 10,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = PIN_NUM_RST,
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR,
+        .bits_per_pixel = 16,
+        .rgb_endian     = LCD_RGB_DATA_ENDIAN_BIG,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel_handle, LCD_X_OFFSET, LCD_Y_OFFSET));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel_handle, true, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel_handle, true));
 }
 
 // -------------------- app_main --------------------
@@ -253,7 +464,13 @@ void app_main(void)
 
     init_st7789();
 
+    // Start draw task 2 on core 1 first — it initialises SPI3/panel2 itself
+    // (binding the SPI ISR to core 1), then signals the semaphore when ready.
+    SemaphoreHandle_t panel2_ready = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(draw_bitmap_task2, "draw_bmp2", 8192, panel2_ready, 2, NULL, 1);
+    xSemaphoreTake(panel2_ready, portMAX_DELAY);
+    vSemaphoreDelete(panel2_ready);
 
-    // Start bitmap drawing task
-    xTaskCreate(draw_bitmap_task, "draw_bitmap", 8192, NULL, 2, NULL);
+    // Now start draw task 1 on core 0 (SPI2 ISR already on core 0 from init_st7789)
+    xTaskCreatePinnedToCore(draw_bitmap_task1, "draw_bmp1", 8192, NULL, 2, NULL, 0);
 }
