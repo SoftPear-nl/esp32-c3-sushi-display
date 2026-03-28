@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GIF → RGB565 .bin for ESP32/ST7789</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    .row  { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; min-width: 300px; }
+    label { display: block; margin: 8px 0 4px; font-size: 14px; }
+    input[type="number"] { width: 110px; }
+    input[type="text"]   { width: 200px; }
+    .small { font-size: 12px; color: #444; line-height: 1.4; }
+    .warn  { color: #c04000; }
+    .ok    { color: #006600; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .grid { display: grid; grid-template-columns: auto auto; gap: 8px 12px; align-items: center; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; background:#fafafa; }
+    .progress-bar  { height:10px; background:#eee; border-radius:5px; overflow:hidden; margin:6px 0 4px; }
+    .progress-fill { height:100%; background:#4a90d9; border-radius:5px; transition:width .08s linear; }
+    .frame-gallery { display:flex; flex-wrap:wrap; gap:4px; max-height:480px; overflow-y:auto;
+                     background:#111; padding:6px; border-radius:6px; }
+    .frame-thumb   { position:relative; }
+    .frame-thumb canvas { display:block; border-radius:2px; }
+    .frame-thumb .fnum  { position:absolute; bottom:1px; left:2px; font-size:9px;
+                          background:rgba(0,0,0,.7); color:#fff; padding:0 3px; border-radius:2px; }
+    canvas { display:none; }
+    code   { background:#f0f0f0; padding:1px 4px; border-radius:3px; font-size:12px; }
+    pre    { background:#f5f5f5; padding:10px; border-radius:6px; font-size:12px; overflow-x:auto; line-height:1.5; }
+  </style>
+</head>
+<body>
+<h2>GIF → packed RGB565 <code>.bin</code> for ESP32 / ST7789</h2>
+<p class="small">
+  Decodes every frame of an animated GIF and packs them into a single raw binary file.<br>
+  Each frame is <b>width × height × 2 bytes</b> of big-endian RGB565 (byte-swapped, ready for ST7789 over SPI).<br>
+  A tiny 8-byte header is prepended: <span class="pill">W u16</span> <span class="pill">H u16</span>
+  <span class="pill">frames u16</span> <span class="pill">fps u16</span> — all little-endian.<br>
+  No ZIP, no BMP headers — <code>fseek(f, 8 + frame*W*H*2, SEEK_SET)</code> and <code>fread</code> is all it takes on the ESP32.
+</p>
+
+<div class="row">
+
+  <!-- ── Controls ── -->
+  <div class="card">
+
+    <label>1) Choose GIF file</label>
+    <input id="fileInput" type="file" accept="image/gif,.gif" />
+    <p class="small" id="gifInfo" style="margin-top:6px;"></p>
+
+    <label>2) Output size (px)</label>
+    <div class="grid">
+      <span>Width</span>  <input id="outW" type="number" value="240" min="1" max="4096" step="1" />
+      <span>Height</span> <input id="outH" type="number" value="320" min="1" max="4096" step="1" />
+    </div>
+
+    <label>Fit mode</label>
+    <div class="grid">
+      <label><input type="radio" name="fit" value="contain" checked /> Contain (letterbox)</label>
+      <label><input type="radio" name="fit" value="cover"   /> Cover (crop to fill)</label>
+    </div>
+
+    <label>Dithering</label>
+    <label><input id="dither" type="checkbox" /> Floyd–Steinberg dither to RGB565</label>
+
+    <label>Output filename</label>
+    <input id="outName" type="text" value="animation" />
+    <p class="small">→ <span id="outNamePreview">animation_240x320.bin</span></p>
+
+    <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+      <button id="btnConvert"  disabled>Convert</button>
+      <button id="btnDownload" disabled>Download .bin</button>
+    </div>
+
+    <div>
+      <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+      <p class="small" id="status">Load a GIF to begin.</p>
+    </div>
+
+    <details style="margin-top:14px;">
+      <summary class="small" style="cursor:pointer;">ESP32 C usage example</summary>
+      <pre id="codeExample">// After download, place the .bin in your flash_fs/ folder
+// and flash with SPIFFS.
+
+#pragma pack(push,1)
+typedef struct { uint16_t w, h, frames, fps; } bin_hdr_t;
+#pragma pack(pop)
+
+void play_bin(esp_lcd_panel_handle_t panel, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    bin_hdr_t hdr;
+    fread(&hdr, sizeof(hdr), 1, f);
+
+    size_t frame_bytes = (size_t)hdr.w * hdr.h * 2;
+    uint16_t *buf = heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM);
+
+    uint32_t frame_ms = hdr.fps ? (1000 / hdr.fps) : 100;
+
+    for (;;) {
+        fseek(f, sizeof(hdr), SEEK_SET);
+        for (int i = 0; i &lt; hdr.frames; i++) {
+            fread(buf, 2, hdr.w * hdr.h, f);
+            esp_lcd_panel_draw_bitmap(panel, 0, 0, hdr.w, hdr.h, buf);
+            vTaskDelay(pdMS_TO_TICKS(frame_ms));
+        }
+    }
+}</pre>
+    </details>
+  </div>
+
+  <!-- ── Preview gallery ── -->
+  <div class="card" style="flex:1; min-width:260px;">
+    <p class="small" style="margin:0 0 6px;">Decoded frames preview</p>
+    <div class="frame-gallery" id="frameGallery">
+      <p class="small" style="color:#888;margin:6px;">No frames yet.</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- Hidden processing canvas -->
+<canvas id="canvas"></canvas>
+
+<script>
+/* ──────────────────────────────────────────────────────────────
+   GIF → packed RGB565 .bin  (self-contained, no CDN)
+   
+   Binary format:
+     Offset 0: uint16_t width        (little-endian)
+     Offset 2: uint16_t height       (little-endian)
+     Offset 4: uint16_t frame_count  (little-endian)
+     Offset 6: uint16_t fps          (little-endian, rounded)
+     Offset 8: frame_count × width × height × uint16_t RGB565
+               Each pixel is byte-swapped (big-endian on wire) for ST7789 SPI.
+────────────────────────────────────────────────────────────── */
+(() => {
+
+  // ── DOM ─────────────────────────────────────────────────────────────────────
+  const fileInputEl  = document.getElementById('fileInput');
+  const outWEl       = document.getElementById('outW');
+  const outHEl       = document.getElementById('outH');
+  const ditherEl     = document.getElementById('dither');
+  const outNameEl    = document.getElementById('outName');
+  const outNamePrev  = document.getElementById('outNamePreview');
+  const btnConvert   = document.getElementById('btnConvert');
+  const btnDownload  = document.getElementById('btnDownload');
+  const statusEl     = document.getElementById('status');
+  const progressFill = document.getElementById('progressFill');
+  const gifInfoEl    = document.getElementById('gifInfo');
+  const frameGallery = document.getElementById('frameGallery');
+  const canvas       = document.getElementById('canvas');
+  const ctx          = canvas.getContext('2d', { willReadFrequently: true });
+  const codeExEl     = document.getElementById('codeExample');
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  let gifFrames   = [];    // [{imageData, delayMs}]  decoded frames
+  let binBlob     = null;
+  let isConverting = false;
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const getFit = () => (document.querySelector('input[name="fit"]:checked') || {}).value || 'contain';
+  const setStatus   = (msg)  => { statusEl.textContent = msg; };
+  const setProgress = (frac) => { progressFill.style.width = (frac * 100).toFixed(1) + '%'; };
+  const yieldBrowser = () => new Promise(r => setTimeout(r, 0));
+
+  function updatePreviewName() {
+    const n = outNameEl.value.replace(/[/\\:*?"<>|]/g, '_') || 'animation';
+    const w = outWEl.value;
+    const h = outHEl.value;
+    outNamePrev.textContent = `${n}_${w}x${h}.bin`;
+  }
+  [outNameEl, outWEl, outHEl].forEach(el => el.addEventListener('input', updatePreviewName));
+  updatePreviewName();
+
+  // ── GIF parser ────────────────────────────────────────────────────────────
+  // Full LZW GIF89a decoder — no external library needed.
+  // Returns [{pixels: Uint8ClampedArray RGBA, delayMs, width, height}]
+  // width/height are the canvas (logical screen) dimensions.
+  function parseGIF(buffer) {
+    const u8 = new Uint8Array(buffer);
+    let p = 0;
+
+    function read8()  { return u8[p++]; }
+    function read16() { const v = u8[p] | (u8[p+1] << 8); p += 2; return v; }
+    function skip(n)  { p += n; }
+
+    // Header
+    const sig = String.fromCharCode(u8[0],u8[1],u8[2],u8[3],u8[4],u8[5]);
+    if (!sig.startsWith('GIF')) throw new Error('Not a GIF file');
+    p = 6;
+
+    // Logical Screen Descriptor
+    const lsW       = read16();
+    const lsH       = read16();
+    const packed    = read8();
+    const bgColorIdx = read8();
+    read8(); // pixel aspect ratio
+    const hasGCT    = (packed >> 7) & 1;
+    const gctSize   = 2 << (packed & 7);
+
+    // Global colour table
+    let gct = null;
+    if (hasGCT) {
+      gct = new Uint8Array(u8.buffer, p, gctSize * 3);
+      p += gctSize * 3;
+    }
+
+    // Canvas accumulator (for disposal methods)
+    const canvas2  = new OffscreenCanvas(lsW, lsH);
+    const ctx2     = canvas2.getContext('2d');
+    const restore  = new OffscreenCanvas(lsW, lsH);
+    const rctx2    = restore.getContext('2d');
+
+    const frames = [];
+    let gcDelay = 0;
+    let gcTranspIdx = -1;
+    let gcDisposal = 0;
+
+    function skipSubBlocks() {
+      let sz;
+      while ((sz = read8()) !== 0) p += sz;
+    }
+
+    function readSubBlocks() {
+      const out = [];
+      let sz;
+      while ((sz = read8()) !== 0) {
+        for (let i = 0; i < sz; i++) out.push(u8[p++]);
+      }
+      return new Uint8Array(out);
+    }
+
+    // LZW decode
+    function lzwDecode(minCodeSize, data) {
+      const clearCode = 1 << minCodeSize;
+      const eofCode   = clearCode + 1;
+      let codeSize    = minCodeSize + 1;
+      let codeMask    = (1 << codeSize) - 1;
+
+      // Build initial table
+      const table = [];
+      for (let i = 0; i < clearCode; i++) table.push(new Uint8Array([i]));
+      table.push(null); // clearCode
+      table.push(null); // eofCode
+
+      const output = [];
+      let bitBuf  = 0;
+      let bitLen  = 0;
+      let dataPos = 0;
+      let prevCode = -1;
+
+      function nextCode() {
+        while (bitLen < codeSize) {
+          if (dataPos >= data.length) return eofCode;
+          bitBuf |= data[dataPos++] << bitLen;
+          bitLen += 8;
+        }
+        const code = bitBuf & codeMask;
+        bitBuf >>= codeSize;
+        bitLen  -= codeSize;
+        return code;
+      }
+
+      // Reset table helper
+      function reset() {
+        table.length = clearCode + 2;
+        codeSize = minCodeSize + 1;
+        codeMask = (1 << codeSize) - 1;
+        prevCode = -1;
+      }
+
+      reset();
+
+      while (true) {
+        const code = nextCode();
+        if (code === eofCode) break;
+        if (code === clearCode) { reset(); continue; }
+
+        let entry;
+        if (code < table.length && table[code]) {
+          entry = table[code];
+        } else if (prevCode !== -1) {
+          // code = prevCode + first byte of prevCode
+          const prev = table[prevCode];
+          entry = new Uint8Array(prev.length + 1);
+          entry.set(prev);
+          entry[prev.length] = prev[0];
+        } else {
+          break;
+        }
+
+        for (let i = 0; i < entry.length; i++) output.push(entry[i]);
+
+        if (prevCode !== -1 && table.length < 4096) {
+          const prev = table[prevCode];
+          const newEntry = new Uint8Array(prev.length + 1);
+          newEntry.set(prev);
+          newEntry[newEntry.length - 1] = entry[0];
+          table.push(newEntry);
+
+          if (table.length === (1 << codeSize) && codeSize < 12) {
+            codeSize++;
+            codeMask = (1 << codeSize) - 1;
+          }
+        }
+
+        prevCode = code;
+      }
+
+      return new Uint8Array(output);
+    }
+
+    while (p < u8.length) {
+      const sep = read8();
+
+      if (sep === 0x3B) break; // GIF trailer
+
+      if (sep === 0x21) {
+        // Extension
+        const label = read8();
+
+        if (label === 0xF9) {
+          // Graphic Control Extension
+          read8(); // block size = 4
+          const gPacked    = read8();
+          gcDelay          = read16() * 10; // centiseconds → ms
+          if (gcDelay < 20) gcDelay = 100;  // clamp bizarre 0-delay GIFs
+          gcTranspIdx      = (gPacked & 1) ? read8() : (read8(), -1);
+          gcDisposal       = (gPacked >> 3) & 7;
+          read8(); // block terminator
+        } else {
+          skipSubBlocks();
+        }
+        continue;
+      }
+
+      if (sep === 0x2C) {
+        // Image Descriptor
+        const imgX   = read16();
+        const imgY   = read16();
+        const imgW   = read16();
+        const imgH   = read16();
+        const iPacked = read8();
+        const hasLCT  = (iPacked >> 7) & 1;
+        const interlace = (iPacked >> 6) & 1;
+        const lctSize   = 2 << (iPacked & 7);
+
+        let ct = gct;
+        if (hasLCT) {
+          ct = new Uint8Array(u8.buffer, p, lctSize * 3);
+          p += lctSize * 3;
+        }
+
+        const minCodeSize = read8();
+        const lzwData     = readSubBlocks();
+        const indices     = lzwDecode(minCodeSize, lzwData);
+
+        // Deinterlace if needed
+        let rows;
+        if (interlace) {
+          const passes = [
+            { start: 0, step: 8 },
+            { start: 4, step: 8 },
+            { start: 2, step: 4 },
+            { start: 1, step: 2 },
+          ];
+          rows = new Array(imgH);
+          let src = 0;
+          for (const pass of passes) {
+            for (let y = pass.start; y < imgH; y += pass.step) {
+              rows[y] = indices.subarray(src, src + imgW);
+              src += imgW;
+            }
+          }
+        } else {
+          rows = [];
+          for (let y = 0; y < imgH; y++)
+            rows.push(indices.subarray(y * imgW, y * imgW + imgW));
+        }
+
+        // Snapshot canvas before draw (for disposal=3)
+        rctx2.clearRect(0, 0, lsW, lsH);
+        rctx2.drawImage(canvas2, 0, 0);
+
+        // Composite this frame onto the canvas
+        const imgData = ctx2.getImageData(0, 0, lsW, lsH);
+        const d = imgData.data;
+        for (let y = 0; y < imgH; y++) {
+          const row = rows[y];
+          for (let x = 0; x < imgW; x++) {
+            const idx  = row[x];
+            if (idx === gcTranspIdx) continue; // transparent
+            const dp   = ((imgY + y) * lsW + (imgX + x)) * 4;
+            const cp   = idx * 3;
+            d[dp]   = ct ? ct[cp]     : 0;
+            d[dp+1] = ct ? ct[cp + 1] : 0;
+            d[dp+2] = ct ? ct[cp + 2] : 0;
+            d[dp+3] = 255;
+          }
+        }
+        ctx2.putImageData(imgData, 0, 0);
+
+        // Snapshot the composited frame
+        const snap = ctx2.getImageData(0, 0, lsW, lsH);
+        frames.push({ pixels: snap.data, delayMs: gcDelay, width: lsW, height: lsH });
+
+        // Apply disposal
+        if (gcDisposal === 2) {
+          // Restore to background
+          ctx2.clearRect(imgX, imgY, imgW, imgH);
+        } else if (gcDisposal === 3) {
+          // Restore to previous
+          ctx2.clearRect(0, 0, lsW, lsH);
+          ctx2.drawImage(restore, 0, 0);
+        }
+        // disposal 0/1: leave as-is
+
+        gcTranspIdx = -1;
+        gcDelay     = 100;
+        gcDisposal  = 0;
+        continue;
+      }
+
+      // Unknown block — bail
+      break;
+    }
+
+    if (frames.length === 0) throw new Error('No frames decoded from GIF');
+    return frames;
+  }
+
+  // ── RGB565 helpers ────────────────────────────────────────────────────────
+  function toRGB565(r, g, b) {
+    return (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)) & 0xFFFF;
+  }
+  function rgb565ToRgb888(v) {
+    const r5=(v>>11)&0x1F, g6=(v>>5)&0x3F, b5=v&0x1F;
+    return [(r5<<3)|(r5>>2), (g6<<2)|(g6>>4), (b5<<3)|(b5>>2)];
+  }
+
+  function quantizeRGB565(imageData, useDither) {
+    const { width, height, data } = imageData;
+    const out = new Uint16Array(width * height);
+    if (!useDither) {
+      for (let p=0, i=0; p<out.length; p++, i+=4)
+        out[p] = toRGB565(data[i], data[i+1], data[i+2]);
+      return out;
+    }
+    const rf = new Float32Array(width*height);
+    const gf = new Float32Array(width*height);
+    const bf = new Float32Array(width*height);
+    for (let p=0,i=0;p<out.length;p++,i+=4){rf[p]=data[i];gf[p]=data[i+1];bf[p]=data[i+2];}
+    const idx=(x,y)=>y*width+x;
+    for (let y=0;y<height;y++) for (let x=0;x<width;x++) {
+      const p=idx(x,y);
+      const r0=clamp(Math.round(rf[p]),0,255);
+      const g0=clamp(Math.round(gf[p]),0,255);
+      const b0=clamp(Math.round(bf[p]),0,255);
+      const q=toRGB565(r0,g0,b0); out[p]=q;
+      const [r1,g1,b1]=rgb565ToRgb888(q);
+      const er=r0-r1,eg=g0-g1,eb=b0-b1;
+      if(x+1<width){const p1=idx(x+1,y);rf[p1]+=er*7/16;gf[p1]+=eg*7/16;bf[p1]+=eb*7/16;}
+      if(y+1<height){
+        if(x>0){const p2=idx(x-1,y+1);rf[p2]+=er*3/16;gf[p2]+=eg*3/16;bf[p2]+=eb*3/16;}
+        const p3=idx(x,y+1);rf[p3]+=er*5/16;gf[p3]+=eg*5/16;bf[p3]+=eb*5/16;
+        if(x+1<width){const p4=idx(x+1,y+1);rf[p4]+=er*1/16;gf[p4]+=eg*1/16;bf[p4]+=eb*1/16;}
+      }
+    }
+    return out;
+  }
+
+  // Scale+composite raw RGBA pixels (lsW×lsH) into canvas at outW×outH, return ImageData
+  function scaleFrame(srcPixels, srcW, srcH, outW, outH, fit) {
+    // Draw src into a temp canvas then scale into main canvas
+    const tmp = new OffscreenCanvas(srcW, srcH);
+    const tctx = tmp.getContext('2d');
+    const id = tctx.createImageData(srcW, srcH);
+    id.data.set(srcPixels);
+    tctx.putImageData(id, 0, 0);
+
+    canvas.width  = outW;
+    canvas.height = outH;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, outW, outH);
+
+    const scaleContain = Math.min(outW/srcW, outH/srcH);
+    const scaleCover   = Math.max(outW/srcW, outH/srcH);
+    const scale = (fit === 'cover') ? scaleCover : scaleContain;
+    const dw = Math.round(srcW * scale);
+    const dh = Math.round(srcH * scale);
+    const dx = Math.floor((outW - dw) / 2);
+    const dy = Math.floor((outH - dh) / 2);
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(tmp, 0, 0, srcW, srcH, dx, dy, dw, dh);
+    return ctx.getImageData(0, 0, outW, outH);
+  }
+
+  // ── Thumbnail ──────────────────────────────────────────────────────────────
+  const THUMB_W = 60;
+  function addThumb(imageData, frameIdx) {
+    const tw = THUMB_W;
+    const th = Math.max(1, Math.round(tw * imageData.height / imageData.width));
+    const full = new OffscreenCanvas(imageData.width, imageData.height);
+    full.getContext('2d').putImageData(imageData, 0, 0);
+    const tc = document.createElement('canvas');
+    tc.width = tw; tc.height = th;
+    tc.style.width = tw + 'px'; tc.style.height = th + 'px';
+    tc.getContext('2d').drawImage(full, 0, 0, tw, th);
+    const wrap = document.createElement('div');
+    wrap.className = 'frame-thumb';
+    const lbl = document.createElement('span');
+    lbl.className = 'fnum'; lbl.textContent = frameIdx;
+    wrap.appendChild(tc); wrap.appendChild(lbl);
+    frameGallery.appendChild(wrap);
+  }
+
+  // ── Load GIF ──────────────────────────────────────────────────────────────
+  fileInputEl.addEventListener('change', () => {
+    const f = fileInputEl.files && fileInputEl.files[0];
+    if (!f) return;
+
+    gifFrames = []; binBlob = null;
+    btnConvert.disabled  = true;
+    btnDownload.disabled = true;
+    frameGallery.innerHTML = '<p class="small" style="color:#888;margin:6px;">Decoding…</p>';
+    setProgress(0); setStatus('Parsing GIF…');
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        gifFrames = parseGIF(e.target.result);
+        // Compute average fps from frame delays
+        const avgDelay = gifFrames.reduce((s,f) => s + f.delayMs, 0) / gifFrames.length;
+        const nativeFps = Math.round(1000 / avgDelay);
+
+        const { width: gw, height: gh } = gifFrames[0];
+        gifInfoEl.innerHTML =
+          `${gifFrames.length} frames &nbsp;|&nbsp; native size ${gw}×${gh}` +
+          ` &nbsp;|&nbsp; avg ${nativeFps} fps` +
+          ` &nbsp;|&nbsp; file ${(e.target.result.byteLength/1024).toFixed(1)} KB`;
+        btnConvert.disabled = false;
+        frameGallery.innerHTML = '<p class="small" style="color:#aaa;margin:6px;">Click Convert to preview.</p>';
+        setStatus(`Loaded ${gifFrames.length} frames. Configure output and click Convert.`);
+      } catch(err) {
+        gifInfoEl.textContent = 'Error: ' + err.message;
+        setStatus('Failed to parse GIF: ' + err.message);
+        console.error(err);
+      }
+    };
+    reader.onerror = () => setStatus('FileReader error.');
+    reader.readAsArrayBuffer(f);
+  });
+
+  // ── Convert ───────────────────────────────────────────────────────────────
+  btnConvert.addEventListener('click', async () => {
+    if (isConverting || !gifFrames.length) return;
+
+    const outW      = clamp(parseInt(outWEl.value, 10)  || 240, 1, 4096);
+    const outH      = clamp(parseInt(outHEl.value, 10)  || 320, 1, 4096);
+    const fit       = getFit();
+    const useDither = ditherEl.checked;
+
+    // Compute representative fps
+    const avgDelay  = gifFrames.reduce((s,f) => s + f.delayMs, 0) / gifFrames.length;
+    const fps       = Math.max(1, Math.round(1000 / avgDelay));
+
+    isConverting = true;
+    btnConvert.disabled  = true;
+    btnDownload.disabled = true;
+    binBlob = null;
+    frameGallery.innerHTML = '';
+    setProgress(0);
+
+    const frameSize  = outW * outH * 2;  // bytes per frame (uint16 RGB565)
+    const HEADER_SZ  = 8;
+    const totalBytes = HEADER_SZ + gifFrames.length * frameSize;
+    const binBuf     = new ArrayBuffer(totalBytes);
+    const dv         = new DataView(binBuf);
+
+    // 8-byte header
+    dv.setUint16(0, outW,            true);
+    dv.setUint16(2, outH,            true);
+    dv.setUint16(4, gifFrames.length, true);
+    dv.setUint16(6, fps,             true);
+
+    try {
+      const u8out = new Uint8Array(binBuf);
+
+      for (let i = 0; i < gifFrames.length; i++) {
+        setStatus(`Converting frame ${i+1} / ${gifFrames.length}…`);
+        await yieldBrowser();
+
+        const gf = gifFrames[i];
+        const scaled = scaleFrame(gf.pixels, gf.width, gf.height, outW, outH, fit);
+        const rgb565 = quantizeRGB565(scaled, useDither);
+
+        // Write big-endian (byte-swapped) RGB565 directly into buffer for ST7789 SPI
+        const base = HEADER_SZ + i * frameSize;
+        for (let px = 0; px < rgb565.length; px++) {
+          const v = rgb565[px];
+          u8out[base + px*2]     = (v >> 8) & 0xFF;   // high byte first
+          u8out[base + px*2 + 1] =  v       & 0xFF;
+        }
+
+        addThumb(scaled, i);
+        setProgress((i+1) / gifFrames.length);
+      }
+
+      binBlob = new Blob([binBuf], { type: 'application/octet-stream' });
+      const kb = (totalBytes / 1024).toFixed(1);
+      setStatus(`Done — ${gifFrames.length} frames × ${outW}×${outH} = ${kb} KB. Click "Download .bin".`);
+      btnDownload.disabled = false;
+      updateCodeExample(outW, outH, fps, gifFrames.length);
+    } catch(err) {
+      console.error(err);
+      setStatus('Error: ' + err.message);
+    } finally {
+      isConverting = false;
+      btnConvert.disabled = false;
+    }
+  });
+
+  // ── Download ──────────────────────────────────────────────────────────────
+  btnDownload.addEventListener('click', () => {
+    if (!binBlob) return;
+    const n = outNameEl.value.replace(/[/\\:*?"<>|]/g, '_') || 'animation';
+    const fname = `${n}_${outWEl.value}x${outHEl.value}.bin`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(binBlob);
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    setStatus(`Downloaded "${fname}".`);
+  });
+
+  // ── Update code example with actual values ─────────────────────────────────
+  function updateCodeExample(w, h, fps, frames) {
+    codeExEl.innerHTML =
+`<span class="ok">// Place ${w}x${h}.bin in flash_fs/ and flash with SPIFFS.</span>
+
+#pragma pack(push,1)
+typedef struct { uint16_t w, h, frames, fps; } bin_hdr_t;
+#pragma pack(pop)
+
+void play_bin(esp_lcd_panel_handle_t panel, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    bin_hdr_t hdr;
+    fread(&hdr, sizeof(hdr), 1, f);
+    <span class="ok">// hdr: w=${w}, h=${h}, frames=${frames}, fps=${fps}</span>
+
+    size_t frame_bytes = (size_t)hdr.w * hdr.h * 2;
+    uint16_t *buf = heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM);
+
+    uint32_t frame_ms = hdr.fps ? (1000 / hdr.fps) : 100;
+
+    for (;;) {
+        fseek(f, sizeof(hdr), SEEK_SET);
+        for (int i = 0; i &lt; hdr.frames; i++) {
+            fread(buf, 2, (size_t)hdr.w * hdr.h, f);
+            esp_lcd_panel_draw_bitmap(panel, 0, 0, hdr.w, hdr.h, buf);
+            vTaskDelay(pdMS_TO_TICKS(frame_ms));
+        }
+    }
+}`;
+  }
+
+})();
+</script>
+</body>
+</html>

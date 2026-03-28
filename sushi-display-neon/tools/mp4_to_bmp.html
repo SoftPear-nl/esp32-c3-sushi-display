@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Video → BMP RGB565 frames for ESP32/ST7789</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; min-width: 300px; }
+    label { display: block; margin: 8px 0 4px; font-size: 14px; }
+    input[type="number"] { width: 110px; }
+    input[type="text"]   { width: 200px; }
+    .small { font-size: 12px; color: #444; line-height: 1.4; }
+    .warn  { color: #8a4b00; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .grid { display: grid; grid-template-columns: auto auto; gap: 8px 12px; align-items: center; }
+    .pill { display: inline-block; padding: 2px 8px; border: 1px solid #ddd; border-radius: 999px; font-size: 12px; background: #fafafa; }
+    .progress-wrap { margin-top: 10px; }
+    .progress-bar  { height: 10px; background: #eee; border-radius: 5px; overflow: hidden; margin-bottom: 4px; }
+    .progress-fill { height: 100%; background: #4a90d9; border-radius: 5px; transition: width 0.08s linear; }
+    .frame-gallery { display: flex; flex-wrap: wrap; gap: 4px; max-height: 520px; overflow-y: auto;
+                     background: #111; padding: 6px; border-radius: 6px; }
+    .frame-thumb   { position: relative; }
+    .frame-thumb canvas { display: block; border-radius: 2px; }
+    .frame-thumb .fnum  { position: absolute; bottom: 1px; left: 2px; font-size: 9px;
+                          background: rgba(0,0,0,.7); color: #fff; padding: 0 3px; border-radius: 2px; }
+    video  { display: none; }
+    canvas { display: none; }
+  </style>
+</head>
+<body>
+  <h2>Convert video (AVI, MP4, …) to 16-bit BMP RGB565 frames for ESP32 / ST7789</h2>
+  <p class="small">
+    Extracts frames from a video (AVI, MP4, WebM, …) and produces <b>16bpp BMP BI_BITFIELDS RGB565</b> files — the same format used by
+    <code>bitmap_convert.html</code> and the ESP32 streaming renderer.<br>
+    All processing runs in the browser. No network requests. Output is a single <b>.zip</b> you can unpack
+    straight into your SPIFFS flash folder.
+  </p>
+
+  <div class="row">
+
+    <!-- ── Left panel: controls ── -->
+    <div class="card">
+
+      <label>1) Choose video file (AVI, MP4, WebM, …)</label>
+      <input id="fileInput" type="file" accept="video/*,.avi" />
+      <p class="small" id="videoInfo" style="margin-top:6px;"></p>
+
+      <label>2) Output size (px)</label>
+      <div class="grid">
+        <span>Width</span>  <input id="outW" type="number" value="240" min="1" max="4096" step="1" />
+        <span>Height</span> <input id="outH" type="number" value="320" min="1" max="4096" step="1" />
+      </div>
+
+      <label>3) Frames to extract per second</label>
+      <div class="grid">
+        <span>FPS</span> <input id="fps" type="number" value="10" min="1" max="60" step="1" />
+      </div>
+      <p class="small" id="frameEstimate"></p>
+
+      <label>4) Filename prefix</label>
+      <input id="prefix" type="text" value="frame" />
+      <p class="small">Files will be named <code>prefix_0000.bmp</code>, <code>prefix_0001.bmp</code> …</p>
+
+      <label>Fit mode</label>
+      <div class="grid">
+        <label><input type="radio" name="fit" value="contain" checked /> Contain (letterbox)</label>
+        <label><input type="radio" name="fit" value="cover"   /> Cover (crop to fill)</label>
+      </div>
+
+      <label>Dithering</label>
+      <label><input id="dither" type="checkbox" /> Floyd–Steinberg dither to RGB565</label>
+      <p class="small warn">Dithering improves gradients but is slow. Disable for large frame counts.</p>
+
+      <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+        <button id="btnExtract"  disabled>Extract frames</button>
+        <button id="btnDownload" disabled>Download ZIP</button>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+        <p class="small" id="status">Load a video to begin.</p>
+      </div>
+    </div>
+
+    <!-- ── Right panel: frame gallery ── -->
+    <div class="card" style="flex:1; min-width:280px;">
+      <p class="small" style="margin:0 0 6px;">Extracted frames preview</p>
+      <div class="frame-gallery" id="frameGallery">
+        <p class="small" style="color:#888; margin:6px;">No frames yet.</p>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Hidden video & canvas used for processing -->
+  <video  id="video"  muted playsinline crossorigin="anonymous"></video>
+  <canvas id="canvas"></canvas>
+
+<script>
+/* ─────────────────────────────────────────────
+   Video (AVI, MP4, …) → BMP RGB565 for ESP32 / ST7789
+   Self-contained: no external dependencies.
+───────────────────────────────────────────── */
+(() => {
+
+  // ── DOM refs ────────────────────────────────────────────────────────────────
+  const fileInputEl   = document.getElementById('fileInput');
+  const outWEl        = document.getElementById('outW');
+  const outHEl        = document.getElementById('outH');
+  const fpsEl         = document.getElementById('fps');
+  const prefixEl      = document.getElementById('prefix');
+  const ditherEl      = document.getElementById('dither');
+  const btnExtract    = document.getElementById('btnExtract');
+  const btnDownload   = document.getElementById('btnDownload');
+  const statusEl      = document.getElementById('status');
+  const progressFill  = document.getElementById('progressFill');
+  const videoInfoEl   = document.getElementById('videoInfo');
+  const frameEstEl    = document.getElementById('frameEstimate');
+  const frameGallery  = document.getElementById('frameGallery');
+  const video         = document.getElementById('video');
+  const canvas        = document.getElementById('canvas');
+  const ctx           = canvas.getContext('2d', { willReadFrequently: true });
+
+  // ── State ────────────────────────────────────────────────────────────────────
+  let capturedFrames  = [];   // [{name:string, data:Uint8Array, crc:number}]
+  let isExtracting    = false;
+  let videoBlobUrl    = null;
+
+  // MJPEG-AVI mode (used when native <video> can't play the file)
+  let aviBuffer       = null;   // ArrayBuffer of the loaded AVI file
+  let aviFrameIndex   = null;   // [{offset, size}] — location of each JPEG in aviBuffer
+  let aviNativeFps    = 0;      // fps read from AVI avih header
+  let aviVideoW       = 0;
+  let aviVideoH       = 0;
+  let videoMode       = 'native'; // 'native' | 'mjpeg'
+
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const getFit = () => (document.querySelector('input[name="fit"]:checked') || {}).value || 'contain';
+  const setStatus   = (msg) => { statusEl.textContent = msg; };
+  const setProgress = (frac) => { progressFill.style.width = (frac * 100).toFixed(1) + '%'; };
+
+  // Yield to browser for repaints/input between heavy operations
+  const yieldBrowser = () => new Promise(r => setTimeout(r, 0));
+
+  // ── MJPEG-AVI parser ─────────────────────────────────────────────────────────
+  // Returns { fps, width, height, frames:[{offset,size}] }
+  // Supports both flat movi and rec-list-wrapped movi chunks.
+  // Throws a descriptive Error on anything it can't parse.
+  function parseAVIMJPEG(arrayBuffer) {
+    const u8  = new Uint8Array(arrayBuffer);
+    const dv  = new DataView(arrayBuffer);
+    const len = arrayBuffer.byteLength;
+
+    function fcc(off) {
+      return String.fromCharCode(u8[off], u8[off+1], u8[off+2], u8[off+3]);
+    }
+    function u32(off) { return dv.getUint32(off, true); }
+    function i32(off) { return dv.getInt32 (off, true); }
+
+    if (len < 12) throw new Error('File too small to be AVI');
+    if (fcc(0) !== 'RIFF') throw new Error('Not a RIFF file (are you sure this is AVI?)');
+    if (fcc(8) !== 'AVI ') throw new Error('RIFF is not AVI');
+
+    let fps   = 0;
+    let vw    = 0;
+    let vh    = 0;
+    let moviStart = -1;
+    let moviEnd   = -1;
+
+    // ── Walk top-level chunks to find hdrl and movi ──────────────────────────
+    let off = 12;
+    while (off + 8 <= len) {
+      const id   = fcc(off);
+      const size = u32(off + 4);
+
+      if (id === 'LIST') {
+        const type = fcc(off + 8);
+
+        if (type === 'hdrl') {
+          // Parse avih inside hdrl to get fps + dimensions
+          let sub = off + 12;
+          const hEnd = off + 8 + size;
+          while (sub + 8 <= hEnd) {
+            const sid  = fcc(sub);
+            const ssz  = u32(sub + 4);
+            if (sid === 'avih' && ssz >= 36) {
+              const usPerFrame = u32(sub + 8);  // dwMicroSecPerFrame
+              if (usPerFrame > 0) fps = 1_000_000 / usPerFrame;
+              vw = u32(sub + 8 + 32);           // dwWidth  (offset 32 in avih)
+              vh = u32(sub + 8 + 36);           // dwHeight (offset 36 in avih)
+            }
+            sub += 8 + ssz + (ssz & 1);
+          }
+        }
+
+        if (type === 'movi') {
+          moviStart = off + 12;
+          moviEnd   = off + 8 + size;
+        }
+      }
+
+      off += 8 + size + (size & 1);
+      if (moviStart !== -1) break; // got what we need
+    }
+
+    if (moviStart === -1) throw new Error('No movi chunk found in AVI');
+    if (moviEnd > len) moviEnd = len;
+
+    // ── Scan movi for video frames (##dc chunks; ## is stream index) ─────────
+    // Handle both flat movi and rec-LIST-wrapped frames.
+    const frames = [];
+
+    function scanMovi(start, end) {
+      let p = start;
+      while (p + 8 <= end) {
+        const id   = fcc(p);
+        const size = u32(p + 4);
+        if (id === 'LIST') {
+          // Recurse into rec  sub-lists
+          scanMovi(p + 12, p + 8 + size);
+        } else if (id.length === 4 &&
+                   ((id[2] === 'd' && id[3] === 'c') ||
+                    (id[2] === 'D' && id[3] === 'C'))) {
+          // Video chunk: verify it starts with JPEG SOI marker FF D8
+          if (p + 10 <= len && u8[p + 8] === 0xFF && u8[p + 9] === 0xD8) {
+            frames.push({ offset: p + 8, size });
+          } else if (size > 0) {
+            // Non-JPEG codec chunk → might be DIB/uncompressed; skip silently
+          }
+        }
+        p += 8 + size + (size & 1);
+      }
+    }
+
+    scanMovi(moviStart, moviEnd);
+
+    if (frames.length === 0)
+      throw new Error(
+        'No MJPEG frames found.\n\n' +
+        'This AVI does not use Motion-JPEG (MJPEG) encoding.\n' +
+        'Please re-export/convert the video to MJPEG-AVI or MP4 and try again.'
+      );
+
+    return { fps: fps || 25, width: vw, height: vh, frames };
+  }
+
+  // ── Video loading ────────────────────────────────────────────────────────────
+  function resetUI() {
+    btnExtract.disabled  = true;
+    btnDownload.disabled = true;
+    capturedFrames = [];
+    aviBuffer      = null;
+    aviFrameIndex  = null;
+    frameGallery.innerHTML = '<p class="small" style="color:#888;margin:6px;">No frames yet.</p>';
+    setProgress(0);
+  }
+
+  fileInputEl.addEventListener('change', () => {
+    const f = fileInputEl.files && fileInputEl.files[0];
+    if (!f) return;
+
+    resetUI();
+    videoInfoEl.textContent = 'Loading…';
+    setStatus('');
+
+    if (videoBlobUrl) URL.revokeObjectURL(videoBlobUrl);
+    videoBlobUrl = URL.createObjectURL(f);
+
+    // Try native <video> first (works for MP4, WebM, and some AVI)
+    videoMode = 'native';
+    video.src = videoBlobUrl;
+    video.load();
+
+    video.onloadedmetadata = () => {
+      videoMode = 'native';
+      updateEstimate();
+      btnExtract.disabled = false;
+      setStatus('Ready (native decoder). Click "Extract frames".');
+    };
+
+    // Native decode failed → try MJPEG-AVI JS parser
+    video.onerror = () => {
+      videoInfoEl.textContent = 'Native decode failed — trying MJPEG-AVI parser…';
+      setStatus('Parsing AVI…');
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const result = parseAVIMJPEG(e.target.result);
+          aviBuffer     = e.target.result;
+          aviFrameIndex = result.frames;
+          aviNativeFps  = result.fps;
+          aviVideoW     = result.width;
+          aviVideoH     = result.height;
+          videoMode     = 'mjpeg';
+          updateEstimateMJPEG();
+          btnExtract.disabled = false;
+          setStatus('Ready (MJPEG parser). Click "Extract frames".');
+        } catch (err) {
+          videoInfoEl.textContent = 'Could not load video.';
+          setStatus('Error: ' + err.message);
+          console.error(err);
+        }
+      };
+      reader.onerror = () => {
+        videoInfoEl.textContent = 'Could not read file.';
+        setStatus('FileReader error.');
+      };
+      reader.readAsArrayBuffer(f);
+    };
+  });
+
+  function updateEstimate() {
+    if (!video.duration || !isFinite(video.duration)) return;
+    const fps    = clamp(parseFloat(fpsEl.value) || 10, 0.5, 60);
+    const total  = Math.floor(video.duration * fps);
+    const outW   = clamp(parseInt(outWEl.value, 10) || 240, 1, 4096);
+    const outH   = clamp(parseInt(outHEl.value, 10) || 320, 1, 4096);
+    const bytesPerFrame = 66 + outW * outH * 2;
+    const totalMB = (total * bytesPerFrame / 1048576).toFixed(1);
+
+    videoInfoEl.textContent =
+      `Duration: ${video.duration.toFixed(2)} s  |  ` +
+      `Native: ${video.videoWidth}×${video.videoHeight}`;
+    frameEstEl.textContent =
+      `~${total} frames at ${fps} fps  ≈  ${totalMB} MB uncompressed`;
+    frameEstEl.className = 'small' + (total > 800 ? ' warn' : '');
+  }
+
+  function updateEstimateMJPEG() {
+    const targetFps  = clamp(parseFloat(fpsEl.value) || 10, 0.5, 60);
+    const step       = Math.max(1, Math.round(aviNativeFps / targetFps));
+    const total      = Math.ceil(aviFrameIndex.length / step);
+    const outW       = clamp(parseInt(outWEl.value, 10) || 240, 1, 4096);
+    const outH       = clamp(parseInt(outHEl.value, 10) || 320, 1, 4096);
+    const bytesPerFrame = 66 + outW * outH * 2;
+    const totalMB    = (total * bytesPerFrame / 1048576).toFixed(1);
+
+    videoInfoEl.textContent =
+      `MJPEG-AVI: ${aviFrameIndex.length} frames @ ${aviNativeFps.toFixed(2)} fps  |  ` +
+      `${aviVideoW}×${aviVideoH}`;
+    frameEstEl.textContent =
+      `~${total} frames sampled (every ${step})  ≈  ${totalMB} MB uncompressed`;
+    frameEstEl.className = 'small' + (total > 800 ? ' warn' : '');
+  }
+
+  [fpsEl, outWEl, outHEl].forEach(el => el.addEventListener('input', () => {
+    if (videoMode === 'mjpeg') updateEstimateMJPEG();
+    else updateEstimate();
+  }));
+
+  // ── RGB565 helpers (identical to bitmap_convert.html) ────────────────────────
+  function toRGB565(r, g, b) {
+    return (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)) & 0xFFFF;
+  }
+
+  function rgb565ToRgb888(v) {
+    const r5 = (v >> 11) & 0x1F;
+    const g6 = (v >>  5) & 0x3F;
+    const b5 =  v        & 0x1F;
+    return [(r5 << 3) | (r5 >> 2), (g6 << 2) | (g6 >> 4), (b5 << 3) | (b5 >> 2)];
+  }
+
+  function quantizeToRGB565Words(imageData, useDither) {
+    const { width, height, data } = imageData;
+    const out = new Uint16Array(width * height);
+
+    if (!useDither) {
+      for (let p = 0, i = 0; p < out.length; p++, i += 4)
+        out[p] = toRGB565(data[i], data[i + 1], data[i + 2]);
+      return out;
+    }
+
+    // Floyd–Steinberg dithering
+    const rf = new Float32Array(width * height);
+    const gf = new Float32Array(width * height);
+    const bf = new Float32Array(width * height);
+    for (let p = 0, i = 0; p < out.length; p++, i += 4) {
+      rf[p] = data[i]; gf[p] = data[i + 1]; bf[p] = data[i + 2];
+    }
+    const idx = (x, y) => y * width + x;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const p  = idx(x, y);
+        const r0 = clamp(Math.round(rf[p]), 0, 255);
+        const g0 = clamp(Math.round(gf[p]), 0, 255);
+        const b0 = clamp(Math.round(bf[p]), 0, 255);
+        const q  = toRGB565(r0, g0, b0);
+        out[p] = q;
+        const [r1, g1, b1] = rgb565ToRgb888(q);
+        const er = r0 - r1, eg = g0 - g1, eb = b0 - b1;
+        if (x + 1 < width) {
+          const p1 = idx(x + 1, y);
+          rf[p1] += er * 7 / 16; gf[p1] += eg * 7 / 16; bf[p1] += eb * 7 / 16;
+        }
+        if (y + 1 < height) {
+          if (x > 0) {
+            const p2 = idx(x - 1, y + 1);
+            rf[p2] += er * 3 / 16; gf[p2] += eg * 3 / 16; bf[p2] += eb * 3 / 16;
+          }
+          const p3 = idx(x, y + 1);
+          rf[p3] += er * 5 / 16; gf[p3] += eg * 5 / 16; bf[p3] += eb * 5 / 16;
+          if (x + 1 < width) {
+            const p4 = idx(x + 1, y + 1);
+            rf[p4] += er * 1 / 16; gf[p4] += eg * 1 / 16; bf[p4] += eb * 1 / 16;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // ── BMP writer — 16bpp BI_BITFIELDS RGB565 top-down ─────────────────────────
+  function makeBmpRgb565(width, height, rgb565Words) {
+    const rowStride      = (width * 2 + 3) & ~3;
+    const pixelArraySize = rowStride * height;
+    const pixelOffset    = 14 + 40 + 12;          // file + info + 3 masks
+    const fileSize       = pixelOffset + pixelArraySize;
+
+    const buf = new ArrayBuffer(fileSize);
+    const dv  = new DataView(buf);
+    let o = 0;
+
+    // BITMAPFILEHEADER
+    dv.setUint16(o, 0x4D42, true); o += 2;        // 'BM'
+    dv.setUint32(o, fileSize,     true); o += 4;
+    dv.setUint16(o, 0,            true); o += 2;  // reserved
+    dv.setUint16(o, 0,            true); o += 2;  // reserved
+    dv.setUint32(o, pixelOffset,  true); o += 4;
+
+    // BITMAPINFOHEADER
+    dv.setUint32(o, 40,       true); o += 4;
+    dv.setInt32 (o,  width,   true); o += 4;
+    dv.setInt32 (o, -height,  true); o += 4;      // negative = top-down
+    dv.setUint16(o, 1,        true); o += 2;      // planes
+    dv.setUint16(o, 16,       true); o += 2;      // bpp
+    dv.setUint32(o, 3,        true); o += 4;      // BI_BITFIELDS
+    dv.setUint32(o, pixelArraySize, true); o += 4;
+    dv.setInt32 (o, 2835,     true); o += 4;      // ~72 dpi
+    dv.setInt32 (o, 2835,     true); o += 4;
+    dv.setUint32(o, 0,        true); o += 4;
+    dv.setUint32(o, 0,        true); o += 4;
+
+    // RGB masks
+    dv.setUint32(o, 0xF800, true); o += 4;
+    dv.setUint32(o, 0x07E0, true); o += 4;
+    dv.setUint32(o, 0x001F, true); o += 4;
+
+    // Pixel data (top-down)
+    for (let y = 0; y < height; y++) {
+      const rowBase = pixelOffset + y * rowStride;
+      for (let x = 0; x < width; x++)
+        dv.setUint16(rowBase + x * 2, rgb565Words[y * width + x], true);
+    }
+
+    return new Uint8Array(buf);
+  }
+
+  // ── CRC-32 (for ZIP) ─────────────────────────────────────────────────────────
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[i] = c >>> 0;
+    }
+    return t;
+  })();
+
+  function crc32(buf) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length; i++)
+      c = (CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  // ── ZIP writer (STORED, no compression, no external lib needed) ───────────────
+  function buildZip(entries) {
+    // entries: [{name:string, data:Uint8Array, crc:number}]
+    const enc = new TextEncoder();
+    const now = new Date();
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+
+    const parts = [];           // raw bytes for sequential local headers + data
+    const centrals = [];        // central directory entries
+    let offset = 0;
+
+    function w16(v) {
+      return new Uint8Array([v & 0xFF, (v >> 8) & 0xFF]);
+    }
+    function w32(v) {
+      v = v >>> 0;
+      return new Uint8Array([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]);
+    }
+
+    for (const e of entries) {
+      const nameBytes = enc.encode(e.name);
+      const size      = e.data.length;
+      const crc       = e.crc;
+
+      // Local file header (30 bytes + name)
+      const local = new Uint8Array(30 + nameBytes.length);
+      local.set([0x50,0x4B,0x03,0x04]);         // signature
+      local.set(w16(20),  4);                   // version needed: 2.0
+      local.set(w16(0),   6);                   // flags
+      local.set(w16(0),   8);                   // compression: STORED
+      local.set(w16(dosTime), 10);
+      local.set(w16(dosDate), 12);
+      local.set(w32(crc),  14);
+      local.set(w32(size), 18);                 // compressed size
+      local.set(w32(size), 22);                 // uncompressed size
+      local.set(w16(nameBytes.length), 26);
+      local.set(w16(0),   28);                  // extra field length
+      local.set(nameBytes, 30);
+
+      parts.push(local, e.data);
+
+      // Central directory entry (46 bytes + name)
+      const cent = new Uint8Array(46 + nameBytes.length);
+      cent.set([0x50,0x4B,0x01,0x02]);          // signature
+      cent.set(w16(20),  4);                    // version made by
+      cent.set(w16(20),  6);                    // version needed
+      cent.set(w16(0),   8);                    // flags
+      cent.set(w16(0),   10);                   // compression: STORED
+      cent.set(w16(dosTime), 12);
+      cent.set(w16(dosDate), 14);
+      cent.set(w32(crc),  16);
+      cent.set(w32(size), 20);                  // compressed size
+      cent.set(w32(size), 24);                  // uncompressed size
+      cent.set(w16(nameBytes.length), 28);
+      cent.set(w16(0),   30);                   // extra field length
+      cent.set(w16(0),   32);                   // comment length
+      cent.set(w16(0),   34);                   // disk number start
+      cent.set(w16(0),   36);                   // internal attrs
+      cent.set(w32(0),   38);                   // external attrs
+      cent.set(w32(offset), 42);                // local header offset
+      cent.set(nameBytes, 46);
+
+      centrals.push(cent);
+      offset += 30 + nameBytes.length + size;
+    }
+
+    const centralSize = centrals.reduce((s, c) => s + c.length, 0);
+
+    // End of central directory (22 bytes)
+    const eocd = new Uint8Array(22);
+    eocd.set([0x50,0x4B,0x05,0x06]);            // signature
+    eocd.set(w16(0),  4);                       // disk number
+    eocd.set(w16(0),  6);                       // disk with central dir
+    eocd.set(w16(entries.length),  8);
+    eocd.set(w16(entries.length), 10);
+    eocd.set(w32(centralSize),    12);
+    eocd.set(w32(offset),         16);          // central dir offset
+    eocd.set(w16(0),              20);          // comment length
+
+    return new Blob([...parts, ...centrals, eocd], { type: 'application/zip' });
+  }
+
+  // ── seekTo (native path) ─────────────────────────────────────────────────────
+  function seekTo(t) {
+    return new Promise((resolve, reject) => {
+      const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+      const onError  = (e) => { video.removeEventListener('error',  onError);  reject(e);  };
+      video.addEventListener('seeked', onSeeked, { once: true });
+      video.addEventListener('error',  onError,  { once: true });
+      video.currentTime = t;
+    });
+  }
+
+  // ── captureFrameFromBitmap — shared render + BMP convert helper ───────────────
+  function captureFrameFromBitmap(source, srcW, srcH, outW, outH, fit, useDither) {
+    canvas.width  = outW;
+    canvas.height = outH;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, outW, outH);
+
+    const scaleContain = Math.min(outW / srcW, outH / srcH);
+    const scaleCover   = Math.max(outW / srcW, outH / srcH);
+    const scale = (fit === 'cover') ? scaleCover : scaleContain;
+    const dw = Math.round(srcW * scale);
+    const dh = Math.round(srcH * scale);
+    const dx = Math.floor((outW - dw) / 2);
+    const dy = Math.floor((outH - dh) / 2);
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, 0, 0, srcW, srcH, dx, dy, dw, dh);
+
+    const imageData = ctx.getImageData(0, 0, outW, outH);
+    const rgb565    = quantizeToRGB565Words(imageData, useDither);
+    const bmpBytes  = makeBmpRgb565(outW, outH, rgb565);
+    const fileCrc   = crc32(bmpBytes);
+    return { bmpBytes, fileCrc, imageData };
+  }
+
+  // ── Thumbnail helpers ─────────────────────────────────────────────────────────
+  const THUMB_W = 60;
+
+  function addThumbnail(imageData, frameIdx) {
+    const tw = THUMB_W;
+    const th = Math.max(1, Math.round(tw * imageData.height / imageData.width));
+
+    // Draw full-size imageData to a temporary canvas, then scale down
+    const full = document.createElement('canvas');
+    full.width  = imageData.width;
+    full.height = imageData.height;
+    full.getContext('2d').putImageData(imageData, 0, 0);
+
+    const tc = document.createElement('canvas');
+    tc.width  = tw; tc.height = th;
+    tc.style.width = tw + 'px'; tc.style.height = th + 'px';
+    tc.getContext('2d').drawImage(full, 0, 0, tw, th);
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'frame-thumb';
+    const num = document.createElement('span');
+    num.className = 'fnum';
+    num.textContent = frameIdx;
+    wrapper.appendChild(tc);
+    wrapper.appendChild(num);
+    frameGallery.appendChild(wrapper);
+  }
+
+  // ── Extraction ───────────────────────────────────────────────────────────────
+  btnExtract.addEventListener('click', async () => {
+    if (isExtracting) return;
+
+    const outW      = clamp(parseInt(outWEl.value, 10)    || 240, 1, 4096);
+    const outH      = clamp(parseInt(outHEl.value, 10)    || 320, 1, 4096);
+    const fps       = clamp(parseFloat(fpsEl.value)       || 10,  0.5, 60);
+    const fit       = getFit();
+    const useDither = ditherEl.checked;
+    const safePrefix = prefixEl.value.replace(/[/\\:*?"<>|]/g, '_') || 'frame';
+
+    isExtracting     = true;
+    btnExtract.disabled  = true;
+    btnDownload.disabled = true;
+    capturedFrames   = [];
+    frameGallery.innerHTML = '';
+    setProgress(0);
+
+    try {
+      if (videoMode === 'mjpeg') {
+        // ── MJPEG-AVI path ────────────────────────────────────────────────────
+        const u8   = new Uint8Array(aviBuffer);
+        const step = Math.max(1, Math.round(aviNativeFps / fps));
+        const selectedIndices = [];
+        for (let i = 0; i < aviFrameIndex.length; i += step)
+          selectedIndices.push(i);
+
+        if (selectedIndices.length > 1200 && !confirm(
+              `This will extract ${selectedIndices.length} frames. Continue?`)) {
+          isExtracting = false;
+          btnExtract.disabled = false;
+          return;
+        }
+
+        let outIdx = 0;
+        for (const fi of selectedIndices) {
+          setStatus(`Extracting frame ${outIdx + 1} / ${selectedIndices.length}…`);
+          await yieldBrowser();
+
+          const { offset, size } = aviFrameIndex[fi];
+          const jpegBlob = new Blob([u8.subarray(offset, offset + size)], { type: 'image/jpeg' });
+          let bitmap;
+          try {
+            bitmap = await createImageBitmap(jpegBlob);
+          } catch (_) {
+            outIdx++;
+            setProgress(outIdx / selectedIndices.length);
+            continue;
+          }
+
+          const srcW = bitmap.width  || aviVideoW || outW;
+          const srcH = bitmap.height || aviVideoH || outH;
+          const { bmpBytes, fileCrc, imageData } =
+            captureFrameFromBitmap(bitmap, srcW, srcH, outW, outH, fit, useDither);
+          bitmap.close();
+
+          const num  = String(outIdx).padStart(4, '0');
+          capturedFrames.push({ name: `${safePrefix}_${num}.bmp`, data: bmpBytes, crc: fileCrc });
+          addThumbnail(imageData, outIdx);
+          setProgress((outIdx + 1) / selectedIndices.length);
+          outIdx++;
+        }
+
+      } else {
+        // ── Native <video> path ───────────────────────────────────────────────
+        const duration = video.duration;
+        if (!duration || !isFinite(duration)) {
+          setStatus('No valid video loaded.');
+          isExtracting = false;
+          btnExtract.disabled = false;
+          return;
+        }
+
+        const interval   = 1 / fps;
+        const timestamps = [];
+        for (let t = 0; t < duration; t += interval)
+          timestamps.push(Math.min(t, duration - 0.001));
+
+        if (timestamps.length > 1200 && !confirm(
+              `This will extract ${timestamps.length} frames (~${
+                (timestamps.length * outW * outH * 2 / 1048576).toFixed(0)
+              } MB). Continue?`)) {
+          isExtracting = false;
+          btnExtract.disabled = false;
+          return;
+        }
+
+        for (let i = 0; i < timestamps.length; i++) {
+          setStatus(`Extracting frame ${i + 1} / ${timestamps.length}…`);
+          await seekTo(timestamps[i]);
+          await yieldBrowser();
+
+          const vw = video.videoWidth  || outW;
+          const vh = video.videoHeight || outH;
+          const { bmpBytes, fileCrc, imageData } =
+            captureFrameFromBitmap(video, vw, vh, outW, outH, fit, useDither);
+
+          const num  = String(i).padStart(4, '0');
+          capturedFrames.push({ name: `${safePrefix}_${num}.bmp`, data: bmpBytes, crc: fileCrc });
+          addThumbnail(imageData, i);
+          setProgress((i + 1) / timestamps.length);
+        }
+      }
+
+      setStatus(`Done — ${capturedFrames.length} frames (${outW}×${outH}). Click "Download ZIP".`);
+      btnDownload.disabled = false;
+    } catch (err) {
+      console.error(err);
+      setStatus('Extraction error: ' + (err.message || err));
+    } finally {
+      isExtracting = false;
+      btnExtract.disabled = false;
+    }
+  });
+
+  // ── ZIP download ──────────────────────────────────────────────────────────────
+  btnDownload.addEventListener('click', () => {
+    if (!capturedFrames.length) return;
+    btnDownload.disabled = true;
+    setStatus('Building ZIP…');
+    setProgress(0);
+
+    // Build ZIP synchronously (fast for stored files — no compression pass)
+    const zip     = buildZip(capturedFrames);
+    const prefix  = prefixEl.value.replace(/[/\\:*?"<>|]/g, '_') || 'frames';
+    const outW    = outWEl.value;
+    const outH    = outHEl.value;
+    const zipName = `${prefix}_${outW}x${outH}_rgb565.zip`;
+
+    const a = document.createElement('a');
+    a.href     = URL.createObjectURL(zip);
+    a.download = zipName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+
+    setProgress(1);
+    setStatus(`Downloaded "${zipName}" with ${capturedFrames.length} frames.`);
+    btnDownload.disabled = false;
+  });
+
+})();
+</script>
+</body>
+</html>

@@ -53,6 +53,15 @@
 esp_lcd_panel_handle_t s_panel_handle;
 esp_lcd_panel_handle_t s_panel_handle2;
 
+// -------------------- .bin split-screen player state --------------------
+/* 8-byte header written by gif_to_bin.html (all fields little-endian) */
+typedef struct { uint16_t w, h, frames, fps; } bin_hdr_t;
+
+static uint16_t          *s_split_left        = NULL;  /* left  240×320 draw buffer, SPIRAM */
+static uint16_t          *s_split_right       = NULL;  /* right 240×320 draw buffer, SPIRAM */
+static SemaphoreHandle_t  s_split_right_ready = NULL;  /* task1 → task2: right half is ready */
+static SemaphoreHandle_t  s_split_right_done  = NULL;  /* task2 → task1: draw finished        */
+
 // -------------------- BMP display functions --------------------
 
 /* Parsed information from a BMP file header */
@@ -343,10 +352,125 @@ void pan_or_bounce_bitmap(esp_lcd_panel_handle_t panel, const char *path, uint32
     bmp_buf_free(&bmp);
 }
 
+// -------------------- .bin split-screen player --------------------
+/*
+ * Play a wide .bin animation spread across two 240-wide screens.
+ * The file must be exactly (LCD_H_RES*2) × LCD_V_RES pixels.
+ * Pixels are big-endian RGB565 as written by gif_to_bin.html — no byte-swap needed.
+ *
+ * Task 1 (core 0): reads each frame, splits rows, draws left half to panel 1.
+ * Task 2 (core 1): receives s_split_right_ready, draws right half to panel 2.
+ * Both SPI buses run simultaneously so frame time ≈ one screen transfer.
+ * Loops forever; only returns if the file cannot be opened.
+ */
+static void play_split_bin(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { ESP_LOGE("BIN", "Cannot open: %s", path); return; }
+
+    bin_hdr_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        ESP_LOGE("BIN", "Header read failed"); fclose(f); return;
+    }
+
+    /* Accept either native 480×320 or half-size 240×160 (2× upscale) */
+    const bool upscale2x = (hdr.w == (uint16_t)LCD_H_RES && hdr.h == (uint16_t)(LCD_V_RES / 2));
+    const bool native    = (hdr.w == (uint16_t)(LCD_H_RES * 2) && hdr.h == (uint16_t)LCD_V_RES);
+    if (!upscale2x && !native) {
+        ESP_LOGE("BIN", "Unsupported size %ux%u (need %dx%d or %dx%d)",
+                 (unsigned)hdr.w, (unsigned)hdr.h,
+                 LCD_H_RES, LCD_V_RES / 2,
+                 LCD_H_RES * 2, LCD_V_RES);
+        fclose(f); return;
+    }
+
+    ESP_LOGI("BIN", "Playing %s: %u frames @ %u fps (%s)",
+             path, (unsigned)hdr.frames, (unsigned)hdr.fps,
+             upscale2x ? "2x upscale" : "native");
+
+    const size_t half_bytes   = (size_t)LCD_H_RES * LCD_V_RES * sizeof(uint16_t);
+    const size_t frame_pixels = (size_t)hdr.w * hdr.h;
+
+    s_split_left  = heap_caps_malloc(half_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_split_right = heap_caps_malloc(half_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint16_t *frame_buf = heap_caps_malloc(frame_pixels * sizeof(uint16_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!s_split_left || !s_split_right || !frame_buf) {
+        ESP_LOGE("BIN", "Buffer alloc failed (%u + %u + %u bytes)",
+                 (unsigned)half_bytes, (unsigned)half_bytes,
+                 (unsigned)(frame_pixels * sizeof(uint16_t)));
+        goto cleanup;
+    }
+
+    const uint32_t frame_ms = (hdr.fps > 0u) ? (1000u / hdr.fps) : 80u;
+
+    while (1) {
+        fseek(f, (long)sizeof(bin_hdr_t), SEEK_SET);
+
+        for (int fi = 0; fi < (int)hdr.frames; fi++) {
+            TickType_t t_start = xTaskGetTickCount();
+
+            /* Read the source frame in one SPIFFS call */
+            fread(frame_buf, sizeof(uint16_t), frame_pixels, f);
+
+            if (upscale2x) {
+                /* 2× nearest-neighbour upscale: 240×160 → 480×320.
+                 * Each source row (sy) produces 2 identical destination rows.
+                 * Left screen  uses source cols  0..119 → dest cols 0..239 (each pixel doubled).
+                 * Right screen uses source cols 120..239 → dest cols 0..239 (each pixel doubled). */
+                for (int sy = 0; sy < (int)hdr.h; sy++) {
+                    const uint16_t *src = frame_buf + (size_t)sy * hdr.w;
+                    for (int rep = 0; rep < 2; rep++) {
+                        const int dy = sy * 2 + rep;
+                        uint16_t *dl = s_split_left  + (size_t)dy * LCD_H_RES;
+                        uint16_t *dr = s_split_right + (size_t)dy * LCD_H_RES;
+                        for (int dx = 0; dx < LCD_H_RES; dx++) {
+                            dl[dx] = src[dx >> 1];               /* cols 0..119 doubled   */
+                            dr[dx] = src[(LCD_H_RES / 2) + (dx >> 1)]; /* cols 120..239 doubled */
+                        }
+                    }
+                }
+            } else {
+                /* Native 480×320: split each row at the midpoint */
+                for (int row = 0; row < LCD_V_RES; row++) {
+                    const uint16_t *src = frame_buf + (size_t)row * hdr.w;
+                    memcpy(s_split_left  + (size_t)row * LCD_H_RES,
+                           src,
+                           (size_t)LCD_H_RES * sizeof(uint16_t));
+                    memcpy(s_split_right + (size_t)row * LCD_H_RES,
+                           src + LCD_H_RES,
+                           (size_t)LCD_H_RES * sizeof(uint16_t));
+                }
+            }
+
+            /* Signal task 2 to draw the right half, then draw the left half in parallel */
+            xSemaphoreGive(s_split_right_ready);
+            esp_lcd_panel_draw_bitmap(s_panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, s_split_left);
+
+            /* Wait for task 2 to finish before we overwrite the buffers on the next frame */
+            xSemaphoreTake(s_split_right_done, portMAX_DELAY);
+
+            /* Pace to target fps */
+            TickType_t elapsed = xTaskGetTickCount() - t_start;
+            TickType_t target  = pdMS_TO_TICKS(frame_ms);
+            if (elapsed < target) vTaskDelay(target - elapsed);
+        }
+    }
+
+cleanup:
+    free(s_split_left);  s_split_left  = NULL;
+    free(s_split_right); s_split_right = NULL;
+    free(frame_buf);
+    fclose(f);
+}
+
 // -------------------- Bitmap draw tasks (one per screen, one per core) --------------------
 static void draw_bitmap_task1(void *arg)
 {
     (void)arg;
+    /* play_split_bin loops forever; only falls through if the file is missing */
+    play_split_bin("/spiffs/kirbyfly.bin");
     while (1) {
         pan_or_bounce_bitmap(s_panel_handle, "/spiffs/sushiro.bmp", 5000);
         pan_or_bounce_bitmap(s_panel_handle, "/spiffs/okinomi.bmp", 5000);
@@ -399,9 +523,12 @@ static void draw_bitmap_task2(void *arg)
     SemaphoreHandle_t ready = (SemaphoreHandle_t)arg;
     xSemaphoreGive(ready);
 
+    /* Slave mode for split .bin playback: draw right halves as signalled by task 1.
+       Both SPI buses transfer simultaneously, so neither core starves the other. */
     while (1) {
-        pan_or_bounce_bitmap(s_panel_handle2, "/spiffs/zanmai.bmp", 5000);
-        pan_or_bounce_bitmap(s_panel_handle2, "/spiffs/pommes.bmp", 5000);
+        xSemaphoreTake(s_split_right_ready, portMAX_DELAY);
+        esp_lcd_panel_draw_bitmap(s_panel_handle2, 0, 0, LCD_H_RES, LCD_V_RES, s_split_right);
+        xSemaphoreGive(s_split_right_done);
     }
     vTaskDelete(NULL);
 }
@@ -463,6 +590,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs_conf));
 
     init_st7789();
+
+    // Create split-screen synchronisation semaphores (must exist before tasks start)
+    s_split_right_ready = xSemaphoreCreateBinary();
+    s_split_right_done  = xSemaphoreCreateBinary();
 
     // Start draw task 2 on core 1 first — it initialises SPI3/panel2 itself
     // (binding the SPI ISR to core 1), then signals the semaphore when ready.
