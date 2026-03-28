@@ -61,6 +61,20 @@ static uint16_t          *s_split_left        = NULL;  /* left  240×320 draw bu
 static uint16_t          *s_split_right       = NULL;  /* right 240×320 draw buffer, SPIRAM */
 static SemaphoreHandle_t  s_split_right_ready = NULL;  /* task1 → task2: right half is ready */
 static SemaphoreHandle_t  s_split_right_done  = NULL;  /* task2 → task1: draw finished        */
+static volatile bool      s_split_active      = false; /* true while split .bin is playing    */
+static QueueHandle_t      s_task2_queue       = NULL;  /* task1 → task2: phase commands       */
+static SemaphoreHandle_t  s_task2_done        = NULL;  /* task2 → task1: phase complete       */
+
+/* Commands sent from task1 to task2 */
+typedef enum { T2_PAN_BOUNCE, T2_SPLIT_SLAVE } t2_cmd_type_t;
+typedef struct {
+    t2_cmd_type_t type;
+    char          path[64];
+    uint32_t      duration_ms;
+} t2_cmd_t;
+
+#define PHASE_PAN_MS    10000u  /* phase 1: panning duration (ms) */
+#define PHASE_STATIC_MS 10000u  /* phase 3: static+bounce duration (ms) */
 
 // -------------------- BMP display functions --------------------
 
@@ -405,10 +419,9 @@ static void play_split_bin(const char *path)
 
     const uint32_t frame_ms = (hdr.fps > 0u) ? (1000u / hdr.fps) : 80u;
 
-    while (1) {
-        fseek(f, (long)sizeof(bin_hdr_t), SEEK_SET);
+    fseek(f, (long)sizeof(bin_hdr_t), SEEK_SET);
 
-        for (int fi = 0; fi < (int)hdr.frames; fi++) {
+    for (int fi = 0; fi < (int)hdr.frames; fi++) {
             TickType_t t_start = xTaskGetTickCount();
 
             /* Read the source frame in one SPIFFS call */
@@ -455,8 +468,11 @@ static void play_split_bin(const char *path)
             TickType_t elapsed = xTaskGetTickCount() - t_start;
             TickType_t target  = pdMS_TO_TICKS(frame_ms);
             if (elapsed < target) vTaskDelay(target - elapsed);
+
+            /* Hold first and last frames for 15 seconds */
+            if (fi == 0 || fi == (int)hdr.frames - 1)
+                vTaskDelay(pdMS_TO_TICKS(15000));
         }
-    }
 
 cleanup:
     free(s_split_left);  s_split_left  = NULL;
@@ -469,11 +485,36 @@ cleanup:
 static void draw_bitmap_task1(void *arg)
 {
     (void)arg;
-    /* play_split_bin loops forever; only falls through if the file is missing */
-    play_split_bin("/spiffs/kirbyfly.bin");
+    t2_cmd_t cmd;
+
     while (1) {
-        pan_or_bounce_bitmap(s_panel_handle, "/spiffs/sushiro.bmp", 5000);
-        pan_or_bounce_bitmap(s_panel_handle, "/spiffs/okinomi.bmp", 5000);
+        /* ---- Phase 1: both screens pan/bounce their images simultaneously ---- */
+        cmd.type = T2_PAN_BOUNCE;
+        strncpy(cmd.path, "/spiffs/okinomi.bmp", sizeof(cmd.path));
+        cmd.duration_ms = PHASE_PAN_MS;
+        xQueueSend(s_task2_queue, &cmd, portMAX_DELAY);
+        pan_or_bounce_bitmap(s_panel_handle, "/spiffs/sushiro.bmp", PHASE_PAN_MS);
+        xSemaphoreTake(s_task2_done, portMAX_DELAY);
+
+        /* ---- Phase 2: shared split animation across both screens ---- */
+        s_split_active = true;
+        cmd.type = T2_SPLIT_SLAVE;
+        cmd.path[0] = '\0';
+        cmd.duration_ms = 0;
+        xQueueSend(s_task2_queue, &cmd, portMAX_DELAY);
+        play_split_bin("/spiffs/kirbyfly.bin");
+        s_split_active = false;
+        xSemaphoreTake(s_task2_done, portMAX_DELAY);
+
+        /* ---- Phase 3: screen 1 static image, screen 2 bouncing ---- */
+        cmd.type = T2_PAN_BOUNCE;
+        strncpy(cmd.path, "/spiffs/okinomi.bmp", sizeof(cmd.path));
+        cmd.duration_ms = PHASE_STATIC_MS;
+        xQueueSend(s_task2_queue, &cmd, portMAX_DELAY);
+        fill_rect_black(s_panel_handle, 0, 0, LCD_H_RES, LCD_V_RES);
+        display_bitmap(s_panel_handle, "/spiffs/sushiro.bmp", 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(PHASE_STATIC_MS));
+        xSemaphoreTake(s_task2_done, portMAX_DELAY);
     }
     vTaskDelete(NULL);
 }
@@ -523,12 +564,29 @@ static void draw_bitmap_task2(void *arg)
     SemaphoreHandle_t ready = (SemaphoreHandle_t)arg;
     xSemaphoreGive(ready);
 
-    /* Slave mode for split .bin playback: draw right halves as signalled by task 1.
-       Both SPI buses transfer simultaneously, so neither core starves the other. */
+    /* Command dispatch loop: task1 sends phases via s_task2_queue */
     while (1) {
-        xSemaphoreTake(s_split_right_ready, portMAX_DELAY);
-        esp_lcd_panel_draw_bitmap(s_panel_handle2, 0, 0, LCD_H_RES, LCD_V_RES, s_split_right);
-        xSemaphoreGive(s_split_right_done);
+        t2_cmd_t cmd;
+        xQueueReceive(s_task2_queue, &cmd, portMAX_DELAY);
+
+        switch (cmd.type) {
+            case T2_PAN_BOUNCE:
+                pan_or_bounce_bitmap(s_panel_handle2, cmd.path, cmd.duration_ms);
+                break;
+
+            case T2_SPLIT_SLAVE:
+                /* Draw right-half frames as signalled by task1 until s_split_active
+                   goes false (checked every 200 ms so we don't block forever). */
+                while (s_split_active) {
+                    if (xSemaphoreTake(s_split_right_ready, pdMS_TO_TICKS(200)) == pdTRUE) {
+                        esp_lcd_panel_draw_bitmap(s_panel_handle2, 0, 0, LCD_H_RES, LCD_V_RES, s_split_right);
+                        xSemaphoreGive(s_split_right_done);
+                    }
+                }
+                break;
+        }
+
+        xSemaphoreGive(s_task2_done);
     }
     vTaskDelete(NULL);
 }
@@ -594,6 +652,8 @@ void app_main(void)
     // Create split-screen synchronisation semaphores (must exist before tasks start)
     s_split_right_ready = xSemaphoreCreateBinary();
     s_split_right_done  = xSemaphoreCreateBinary();
+    s_task2_queue       = xQueueCreate(1, sizeof(t2_cmd_t));
+    s_task2_done        = xSemaphoreCreateBinary();
 
     // Start draw task 2 on core 1 first — it initialises SPI3/panel2 itself
     // (binding the SPI ISR to core 1), then signals the semaphore when ready.
