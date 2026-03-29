@@ -86,7 +86,7 @@ static void lcd_init(void)
     esp_lcd_panel_io_spi_config_t io_cfg1 = {
         .dc_gpio_num       = PIN_NUM_DC,
         .cs_gpio_num       = PIN_NUM_CS,
-        .pclk_hz           = 40 * 1000 * 1000,  // 40 MHz; bump to 80 MHz if stable
+        .pclk_hz           = 80 * 1000 * 1000,  // 40 MHz; bump to 80 MHz if stable
         .lcd_cmd_bits      = 8,
         .lcd_param_bits    = 8,
         .spi_mode          = 0,
@@ -193,7 +193,7 @@ static const scene_t s_display_sequence[] = {
     {
         .type           = SCENE_ANIM_DUAL,
         .file_path      = "/spiffs/kirbyfly.bin",
-        .first_frame_ms = 2000,
+        .first_frame_ms = 10000,
         .last_frame_ms  = 10000,
         .dual_mode      = DUAL_SPLIT_H,
         .scale          = 2,

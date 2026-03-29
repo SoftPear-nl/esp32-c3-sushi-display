@@ -24,6 +24,7 @@
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -112,8 +113,9 @@ static uint16_t *bmp_load(const char *path, bmp_info_t *info_out)
             uint16_t px = row_buf[c];
             dst[c] = (uint16_t)((px >> 8) | (px << 8)); // LE→BE
         }
-        // Yield every 16 rows so IDLE task can reset the watchdog
-        if ((disk_row & 15) == 15) vTaskDelay(pdMS_TO_TICKS(1));
+        // Yield every 16 rows so IDLE task can reset the watchdog.
+        // Use raw tick (1), NOT pdMS_TO_TICKS(1) which is 0 on 100 Hz systems.
+        if ((disk_row & 15) == 15) vTaskDelay(1);
     }
 
     free(row_buf);
@@ -138,7 +140,7 @@ static void clear_screen(esp_lcd_panel_handle_t panel)
         static uint16_t zline[LCD_W]; // zero-initialised in BSS
         for (int y = 0; y < LCD_H; y++) {
             esp_lcd_panel_draw_bitmap(panel, 0, y, LCD_W, y + 1, zline);
-            if ((y & 15) == 15) vTaskDelay(pdMS_TO_TICKS(1));
+            if ((y & 15) == 15) vTaskDelay(1); // raw tick, not pdMS_TO_TICKS(1)
         }
     }
 }
@@ -460,14 +462,31 @@ static void scale_half(const uint16_t *frame_buf, int anim_w,
                         uint16_t *dest)
 {
     int dest_w = src_w * scale;
+
+    if (scale == 2) {
+        // Fast-path for 2×: write two identical pixels as one uint32_t,
+        // then memcpy the first scaled row to produce the duplicate row.
+        for (int src_r = 0; src_r < src_h; src_r++) {
+            const uint16_t *src_row = frame_buf + (size_t)src_r * anim_w + src_col_offset;
+            uint16_t *row0 = dest + (size_t)(src_r * 2)     * dest_w;
+            uint16_t *row1 = dest + (size_t)(src_r * 2 + 1) * dest_w;
+            uint32_t *out32 = (uint32_t *)row0;
+            for (int src_c = 0; src_c < src_w; src_c++) {
+                uint32_t px = src_row[src_c];
+                out32[src_c] = px | (px << 16); // two identical pixels
+            }
+            memcpy(row1, row0, (size_t)dest_w * 2); // duplicate row
+        }
+        return;
+    }
+
+    // Generic path for other scale factors
     for (int src_r = 0; src_r < src_h; src_r++) {
         const uint16_t *src_row = frame_buf + (size_t)src_r * anim_w + src_col_offset;
-        // Write `scale` identical destination rows
         for (int dr = 0; dr < scale; dr++) {
             uint16_t *dst_row = dest + (size_t)(src_r * scale + dr) * dest_w;
             for (int src_c = 0; src_c < src_w; src_c++) {
                 uint16_t px = src_row[src_c];
-                // Write `scale` identical destination columns
                 for (int dc = 0; dc < scale; dc++) {
                     dst_row[src_c * scale + dc] = px;
                 }
@@ -486,7 +505,6 @@ static void scene_anim_dual(esp_lcd_panel_handle_t panel1,
         return;
     }
 
-    // Parse 8-byte header
     uint8_t hdr[8];
     if (fread(hdr, 1, sizeof(hdr), f) < sizeof(hdr)) {
         ESP_LOGE(TAG, "anim: short header in '%s'", s->file_path);
@@ -497,49 +515,41 @@ static void scene_anim_dual(esp_lcd_panel_handle_t panel1,
     int      anim_h   = (int)(hdr[2] | (hdr[3] << 8));
     int      frames   = (int)(hdr[4] | (hdr[5] << 8));
     int      fps      = (int)(hdr[6] | (hdr[7] << 8));
-    uint32_t frame_ms = (fps > 0) ? (1000u / (uint32_t)fps) : 100u;
+    int64_t  frame_us = (fps > 0) ? (1000000LL / fps) : 100000LL;
     int      sc       = (s->scale > 1) ? s->scale : 1;
 
     ESP_LOGI(TAG, "anim: %dx%d  %d frames @ %d fps  scale=%d",
              anim_w, anim_h, frames, fps, sc);
 
-    // Raw source frame buffer
     size_t frame_bytes = (size_t)anim_w * anim_h * 2;
     uint16_t *frame_buf = heap_caps_malloc(frame_bytes,
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!frame_buf) {
-        ESP_LOGE(TAG, "anim: OOM frame buffer (%u B)", (unsigned)frame_bytes);
-        fclose(f);
-        return;
+        ESP_LOGE(TAG, "anim: OOM frame buffer"); fclose(f); return;
     }
 
-    // Output buffer for one screen's worth of pixels (after optional scaling)
-    int half_src_w  = (s->dual_mode == DUAL_SPLIT_H) ? anim_w / 2 : anim_w;
-    int out_w       = half_src_w * sc;   // pixels wide sent to one panel
-    int out_h       = anim_h     * sc;   // pixels tall sent to one panel
+    int half_src_w = (s->dual_mode == DUAL_SPLIT_H) ? anim_w / 2 : anim_w;
+    int out_w      = half_src_w * sc;
+    int out_h      = anim_h     * sc;
+    int draw_w     = out_w < LCD_W ? out_w : LCD_W;
+    int draw_h     = out_h < LCD_H ? out_h : LCD_H;
+    int off_x      = (LCD_W - draw_w) / 2;
+    int off_y      = (LCD_H - draw_h) / 2;
 
-    // Clamp to screen dimensions
-    int draw_w = out_w < LCD_W ? out_w : LCD_W;
-    int draw_h = out_h < LCD_H ? out_h : LCD_H;
-    int off_x  = (LCD_W - draw_w) / 2;
-    int off_y  = (LCD_H - draw_h) / 2;
-
-    // One panel-sized output buffer (reused for panel1 then panel2)
     size_t out_bytes = (size_t)out_w * out_h * 2;
-    uint16_t *out_buf = heap_caps_malloc(out_bytes,
-                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!out_buf) {
-        ESP_LOGE(TAG, "anim: OOM output buffer (%u B)", (unsigned)out_bytes);
-        free(frame_buf);
-        fclose(f);
-        return;
+    uint16_t *buf1 = heap_caps_malloc(out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint16_t *buf2 = heap_caps_malloc(out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf1 || !buf2) {
+        ESP_LOGE(TAG, "anim: OOM output buffers");
+        free(buf1); free(buf2); free(frame_buf); fclose(f); return;
     }
 
     clear_screen(panel1);
     clear_screen(panel2);
 
-    // Frames are packed sequentially — pure fread, no fseek per frame
     for (int fi = 0; fi < frames; fi++) {
+        int64_t t0 = esp_timer_get_time();
+
         if (fread(frame_buf, 2, (size_t)anim_w * anim_h, f) <
                 (size_t)(anim_w * anim_h)) {
             ESP_LOGW(TAG, "anim: short read at frame %d", fi);
@@ -547,33 +557,38 @@ static void scene_anim_dual(esp_lcd_panel_handle_t panel1,
         }
 
         if (s->dual_mode == DUAL_SPLIT_H) {
-            // Left half → panel1
-            scale_half(frame_buf, anim_w,
-                       0, half_src_w, anim_h, sc, out_buf);
-            esp_lcd_panel_draw_bitmap(panel1, off_x, off_y,
-                                      off_x + draw_w, off_y + draw_h, out_buf);
-
-            // Right half → panel2
-            scale_half(frame_buf, anim_w,
-                       half_src_w, half_src_w, anim_h, sc, out_buf);
-            esp_lcd_panel_draw_bitmap(panel2, off_x, off_y,
-                                      off_x + draw_w, off_y + draw_h, out_buf);
+            scale_half(frame_buf, anim_w, 0,          half_src_w, anim_h, sc, buf1);
+            scale_half(frame_buf, anim_w, half_src_w, half_src_w, anim_h, sc, buf2);
         } else {
-            // DUAL_SAME: scale full frame, send to both panels
-            scale_half(frame_buf, anim_w, 0, anim_w, anim_h, sc, out_buf);
-            esp_lcd_panel_draw_bitmap(panel1, off_x, off_y,
-                                      off_x + draw_w, off_y + draw_h, out_buf);
-            esp_lcd_panel_draw_bitmap(panel2, off_x, off_y,
-                                      off_x + draw_w, off_y + draw_h, out_buf);
+            scale_half(frame_buf, anim_w, 0, anim_w, anim_h, sc, buf1);
+            memcpy(buf2, buf1, out_bytes);
         }
 
-        uint32_t delay = frame_ms;
-        if      (fi == 0         && s->first_frame_ms > 0) delay = s->first_frame_ms;
-        else if (fi == frames - 1 && s->last_frame_ms  > 0) delay = s->last_frame_ms;
-        vTaskDelay(pdMS_TO_TICKS(delay));
+        // Sequential sends — no extra task, no priority starvation of IDLE.
+        // SPI DMA is still hardware-accelerated; the CPU is mostly idle during
+        // the transfer anyway (driver blocks on a semaphore between chunks).
+        esp_lcd_panel_draw_bitmap(panel1, off_x, off_y,
+                                  off_x + draw_w, off_y + draw_h, buf1);
+        esp_lcd_panel_draw_bitmap(panel2, off_x, off_y,
+                                  off_x + draw_w, off_y + draw_h, buf2);
+
+        // Determine target frame duration
+        int64_t target_us = frame_us;
+        if      (fi == 0          && s->first_frame_ms > 0) target_us = (int64_t)s->first_frame_ms * 1000;
+        else if (fi == frames - 1 && s->last_frame_ms  > 0) target_us = (int64_t)s->last_frame_ms  * 1000;
+
+        // Always yield at least one raw RTOS tick so IDLE can feed the WDT.
+        // CRITICAL: pdMS_TO_TICKS(1) == 0 on a 100 Hz tick system, so
+        // vTaskDelay(pdMS_TO_TICKS(1)) is a no-op.  Use raw ticks instead:
+        // vTaskDelay(1) always suspends for exactly 1 tick regardless of Hz.
+        int64_t elapsed_us   = esp_timer_get_time() - t0;
+        int64_t remaining_ms = (target_us - elapsed_us) / 1000;
+        TickType_t ticks = (remaining_ms > 0) ? pdMS_TO_TICKS((uint32_t)remaining_ms) : 0;
+        vTaskDelay(ticks > 0 ? ticks : 1);
     }
 
-    free(out_buf);
+    free(buf1);
+    free(buf2);
     free(frame_buf);
     fclose(f);
 }
