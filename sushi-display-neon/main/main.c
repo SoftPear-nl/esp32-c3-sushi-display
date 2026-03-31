@@ -49,7 +49,7 @@
 #define PIN_LETTER_U        16
 #define PIN_LETTER_S2       17
 #define PIN_LETTER_H        18
-#define PIN_LETTER_I        21
+#define PIN_LETTER_I        4
 
 // -------------------- LCD handles --------------------
 static esp_lcd_panel_handle_t s_panel1 = NULL;
