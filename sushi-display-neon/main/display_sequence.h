@@ -89,3 +89,11 @@ void display_sequence_run(
         esp_lcd_panel_handle_t panel2,
         const scene_t         *scenes,
         int                    scene_count);
+
+/**
+ * @brief Request the currently running scene to exit as soon as possible.
+ *
+ * Safe to call from any task/ISR context.  The flag is cleared automatically
+ * at the start of each display_sequence_run() call.
+ */
+void display_sequence_request_abort(void);

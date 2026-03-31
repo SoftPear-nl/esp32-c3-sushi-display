@@ -30,6 +30,14 @@
 
 static const char *TAG = "disp_seq";
 
+// Set by display_sequence_request_abort(); cleared at the start of each run.
+static volatile bool s_abort_requested = false;
+
+void display_sequence_request_abort(void)
+{
+    s_abort_requested = true;
+}
+
 #define LCD_W  240
 #define LCD_H  320
 
@@ -174,7 +182,12 @@ static void scene_static(esp_lcd_panel_handle_t panel, const scene_t *s)
     }
 
     free(img);
-    vTaskDelay(pdMS_TO_TICKS(s->duration_ms));
+    // Split the hold time into 50 ms slices so an abort request is noticed quickly
+    uint32_t elapsed = 0;
+    while (!s_abort_requested && elapsed < s->duration_ms) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        elapsed += 50;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +253,7 @@ static void scene_pan(esp_lcd_panel_handle_t panel, const scene_t *s)
 
         esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb);
         vTaskDelay(pdMS_TO_TICKS(s->pan_step_ms > 0 ? s->pan_step_ms : 1));
+        if (s_abort_requested) break;
     }
 
     free(fb);
@@ -311,6 +325,7 @@ void display_sequence_run(
         const scene_t         *scenes,
         int                    scene_count)
 {
+    s_abort_requested = false;
     for (int i = 0; i < scene_count; i++) {
         const scene_t *s = &scenes[i];
 
@@ -346,6 +361,7 @@ void display_sequence_run(
         } else {
             run_single_scene(panel1, panel2, s);
         }
+        if (s_abort_requested) break;
     }
 }
 
@@ -420,6 +436,7 @@ static void scene_bounce(esp_lcd_panel_handle_t panel, const scene_t *s)
         }
 
         vTaskDelay(pdMS_TO_TICKS(s->bounce_step_ms > 0 ? s->bounce_step_ms : 16));
+        if (s_abort_requested) break;
     }
 
     #undef BLIT
@@ -585,6 +602,7 @@ static void scene_anim_dual(esp_lcd_panel_handle_t panel1,
         int64_t remaining_ms = (target_us - elapsed_us) / 1000;
         TickType_t ticks = (remaining_ms > 0) ? pdMS_TO_TICKS((uint32_t)remaining_ms) : 0;
         vTaskDelay(ticks > 0 ? ticks : 1);
+        if (s_abort_requested) break;
     }
 
     free(buf1);

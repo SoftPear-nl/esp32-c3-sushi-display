@@ -17,6 +17,8 @@
 #include "esp_spiffs.h"
 #include "neon_letter_service.h"
 #include "display_sequence.h"
+#include "config_menu.h"
+#include "freertos/queue.h"
 
 // -------------------- Display config --------------------
 // ESP32-S3 N16R8: two independent SPI buses, one per screen
@@ -50,6 +52,70 @@
 #define PIN_LETTER_S2       17
 #define PIN_LETTER_H        18
 #define PIN_LETTER_I        4
+
+// -------------------- 5-way switch --------------------
+// NOTE: GPIO 26-32 = internal flash; GPIO 33-40 = OctalSPI PSRAM (N16R8).
+//       Use only GPIOs outside those ranges for user I/O.
+#define PIN_5WAY_UP         2
+#define PIN_5WAY_DOWN       1
+#define PIN_5WAY_LEFT      47
+#define PIN_5WAY_RIGHT     21
+#define PIN_5WAY_CENTER    48
+
+// -------------------- 5-way switch --------------------
+static const struct { int pin; const char *name; } s_5way_buttons[] = {
+    { PIN_5WAY_UP,     "UP"     },
+    { PIN_5WAY_DOWN,   "DOWN"   },
+    { PIN_5WAY_LEFT,   "LEFT"   },
+    { PIN_5WAY_RIGHT,  "RIGHT"  },
+    { PIN_5WAY_CENTER, "CENTER" },
+};
+#define NUM_5WAY_BUTTONS (sizeof(s_5way_buttons) / sizeof(s_5way_buttons[0]))
+
+// Map button index to btn_event_t (order matches s_5way_buttons)
+static const btn_event_t s_btn_events[] = {
+    BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_CENTER
+};
+
+static void five_way_switch_task(void *arg)
+{
+    bool prev[NUM_5WAY_BUTTONS];
+    for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++)
+        prev[i] = gpio_get_level(s_5way_buttons[i].pin);
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++) {
+            bool cur = gpio_get_level(s_5way_buttons[i].pin);
+            if (!cur && prev[i]) { // falling edge = press (active-low)
+                btn_event_t evt = s_btn_events[i];
+                if (evt == BTN_CENTER) {
+                    // Interrupt the running display scene immediately
+                    display_sequence_request_abort();
+                }
+                xQueueSend(config_menu_get_queue(), &evt, 0);
+            }
+            prev[i] = cur;
+        }
+    }
+}
+
+static void five_way_switch_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_5WAY_UP)   |
+                        (1ULL << PIN_5WAY_DOWN)  |
+                        (1ULL << PIN_5WAY_LEFT)  |
+                        (1ULL << PIN_5WAY_RIGHT) |
+                        (1ULL << PIN_5WAY_CENTER),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    xTaskCreate(five_way_switch_task, "5way_sw", 4096, NULL, 5, NULL);
+}
 
 // -------------------- LCD handles --------------------
 static esp_lcd_panel_handle_t s_panel1 = NULL;
@@ -207,6 +273,7 @@ void app_main(void)
              esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
 
     neon_letter_init(PIN_LETTER_S1, PIN_LETTER_U, PIN_LETTER_S2, PIN_LETTER_H, PIN_LETTER_I);
+    five_way_switch_init(); // also starts the switch polling task
 
     // Mount SPIFFS
     esp_vfs_spiffs_conf_t spiffs_conf = {
@@ -220,8 +287,20 @@ void app_main(void)
     // Initialise LCD panels
     lcd_init();
 
+    // Initialise config menu (uses screen 2)
+    config_menu_init(s_panel2);
+
     // Run the display sequence (loops forever)
     while (1) {
+        // Let the menu handle any pending button events
+        config_menu_tick();
+
+        // Pause the display sequence while the menu is open
+        if (config_menu_is_open()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         display_sequence_run(s_panel1, s_panel2,
                              s_display_sequence,
                              sizeof(s_display_sequence) / sizeof(s_display_sequence[0]));
