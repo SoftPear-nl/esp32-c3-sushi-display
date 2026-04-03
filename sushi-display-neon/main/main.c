@@ -26,6 +26,71 @@ static const char *s_led_mode_names[] = {
     [LED_MODE_OFF]          = "OFF",
 };
 
+// -------------------- Display mode --------------------
+typedef enum {
+    DISPLAY_MODE_NORMAL = 0,
+    DISPLAY_MODE_WIFI,
+    DISPLAY_MODE_COUNT,
+} display_mode_t;
+
+static volatile display_mode_t s_display_mode = DISPLAY_MODE_NORMAL;
+
+static const char *s_display_mode_names[] = {
+    [DISPLAY_MODE_NORMAL] = "NORMAL",
+    [DISPLAY_MODE_WIFI]   = "WIFI",
+};
+
+// -------------------- Cursor (arrow) --------------------
+#define CURSOR_W    9                      // bounding-box width  (cols 0-8)
+#define CURSOR_H   17                      // bounding-box height (rows 0-16)
+#define CURSOR_STEP 10                     // pixels per d-pad press
+#define VIRTUAL_W  (LCD_H_RES * 2)         // total virtual width spanning both screens
+
+static volatile int s_cursor_x = 0;  // set to centre each time WIFI mode opens
+static volatile int s_cursor_y = 0;
+
+/* Standard NW-pointing arrow cursor.
+ * 16-bit row bitmasks; bit 15 = leftmost column (col 0), 1 = black pixel.
+ *
+ *   col: 0 1 2 3 4 5 6 7 8
+ *   row 0:  *
+ *   row 1:  * *
+ *   row 2:  * * *
+ *   row 3:  * * * *
+ *   row 4:  * * * * *
+ *   row 5:  * * * * * *
+ *   row 6:  * * * * * * *
+ *   row 7:  * * * * * * * *
+ *   row 8:  * * * * * * * * *
+ *   row 9:  * * * * * *
+ *   row10:  * * * . * * *
+ *   row11:  * . . . . * * *
+ *   row12:  . . . . . * * *
+ *   row13:  . . . . . . * * *
+ *   row14:  . . . . . . * * *
+ *   row15:  . . . . . . . * *
+ *   row16:  . . . . . . . * *
+ */
+static const uint16_t s_arrow_bitmap[CURSOR_H] = {
+    0x8000, // row  0 – tip
+    0xC000, // row  1
+    0xE000, // row  2
+    0xF000, // row  3
+    0xF800, // row  4
+    0xFC00, // row  5
+    0xFE00, // row  6
+    0xFF00, // row  7
+    0xFF80, // row  8 – widest
+    0xFC00, // row  9 – notch cuts right side
+    0xEE00, // row 10 – gap between head and shaft
+    0x8700, // row 11 – shaft begins
+    0x0700, // row 12
+    0x0380, // row 13
+    0x0380, // row 14
+    0x0180, // row 15
+    0x0180, // row 16
+};
+
 // -------------------- Display config --------------------
 // ESP32-S3 N16R8: two independent SPI buses, one per screen
 #define LCD_HOST               SPI2_HOST   // Screen 1
@@ -78,27 +143,100 @@ static const struct { int pin; const char *name; } s_5way_buttons[] = {
 };
 #define NUM_5WAY_BUTTONS (sizeof(s_5way_buttons) / sizeof(s_5way_buttons[0]))
 
+#define CURSOR_REPEAT_DELAY_MS  400   // ms before auto-repeat starts
+#define CURSOR_REPEAT_RATE_MS    80   // ms between repeated steps while held
+
+// Move cursor one step for the given pin; call on press and on each repeat tick.
+static void cursor_move(int pin)
+{
+    switch (pin) {
+        case PIN_5WAY_LEFT: {
+            int nx = s_cursor_x - CURSOR_STEP;
+            s_cursor_x = nx < 0 ? 0 : nx;
+            break;
+        }
+        case PIN_5WAY_RIGHT: {
+            int nx = s_cursor_x + CURSOR_STEP;
+            s_cursor_x = nx > VIRTUAL_W - CURSOR_W ? VIRTUAL_W - CURSOR_W : nx;
+            break;
+        }
+        case PIN_5WAY_UP: {
+            int ny = s_cursor_y - CURSOR_STEP;
+            s_cursor_y = ny < 0 ? 0 : ny;
+            break;
+        }
+        case PIN_5WAY_DOWN: {
+            int ny = s_cursor_y + CURSOR_STEP;
+            s_cursor_y = ny > LCD_V_RES - CURSOR_H ? LCD_V_RES - CURSOR_H : ny;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 static void five_way_switch_task(void *arg)
 {
-    bool prev[NUM_5WAY_BUTTONS];
-    for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++)
-        prev[i] = gpio_get_level(s_5way_buttons[i].pin);
+    bool     prev[NUM_5WAY_BUTTONS];
+    TickType_t held_since[NUM_5WAY_BUTTONS];
+    TickType_t last_repeat[NUM_5WAY_BUTTONS];
+
+    for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++) {
+        prev[i]        = gpio_get_level(s_5way_buttons[i].pin);
+        held_since[i]  = 0;
+        last_repeat[i] = 0;
+    }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
+        TickType_t now = xTaskGetTickCount();
+
         for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++) {
             bool cur = gpio_get_level(s_5way_buttons[i].pin);
-            if (!cur && prev[i]) { // falling edge = press (active-low)
+            int  pin = s_5way_buttons[i].pin;
+
+            if (!cur && prev[i]) {
+                // ── Falling edge: first press ────────────────────────────────
                 ESP_LOGI(TAG, "Button pressed: %s", s_5way_buttons[i].name);
-                switch (s_5way_buttons[i].pin) {
+                held_since[i]  = now;
+                last_repeat[i] = now;
+
+                switch (pin) {
                     case PIN_5WAY_CENTER:
-                        current_led_mode = (current_led_mode + 1) % LED_MODE_COUNT;
-                        ESP_LOGI(TAG, "LED mode -> %s", s_led_mode_names[current_led_mode]);
+                        s_display_mode = (s_display_mode + 1) % DISPLAY_MODE_COUNT;
+                        ESP_LOGI(TAG, "Display mode -> %s", s_display_mode_names[s_display_mode]);
+                        display_sequence_request_abort();
+                        break;
+                    case PIN_5WAY_LEFT:
+                    case PIN_5WAY_RIGHT:
+                    case PIN_5WAY_UP:
+                    case PIN_5WAY_DOWN:
+                        if (s_display_mode == DISPLAY_MODE_WIFI) {
+                            cursor_move(pin);
+                        } else if (s_display_mode == DISPLAY_MODE_NORMAL) {
+                            current_led_mode = (current_led_mode + 1) % LED_MODE_COUNT;
+                            ESP_LOGI(TAG, "LED mode -> %s", s_led_mode_names[current_led_mode]);
+                        }
                         break;
                     default:
                         break;
                 }
+
+            } else if (!cur && !prev[i]) {
+                // ── Held: auto-repeat cursor movement in WIFI mode only ───────
+                if (s_display_mode == DISPLAY_MODE_WIFI &&
+                    (pin == PIN_5WAY_LEFT || pin == PIN_5WAY_RIGHT ||
+                     pin == PIN_5WAY_UP   || pin == PIN_5WAY_DOWN)) {
+                    TickType_t held_ms   = (now - held_since[i])  * portTICK_PERIOD_MS;
+                    TickType_t repeat_ms = (now - last_repeat[i]) * portTICK_PERIOD_MS;
+                    if (held_ms  >= CURSOR_REPEAT_DELAY_MS &&
+                        repeat_ms >= CURSOR_REPEAT_RATE_MS) {
+                        cursor_move(pin);
+                        last_repeat[i] = now;
+                    }
+                }
             }
+
             prev[i] = cur;
         }
     }
@@ -219,6 +357,74 @@ static void lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel2, true));
 }
 
+// -------------------- Display mode: white screens + movable cursor --------------------
+static void display_white_screens(void)
+{
+    const size_t line_bytes = LCD_H_RES * sizeof(uint16_t);
+    uint16_t *line = heap_caps_malloc(line_bytes, MALLOC_CAP_DMA);
+    if (!line) {
+        ESP_LOGE(TAG, "Failed to allocate white line buffer");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        return;
+    }
+
+    // Centre the cursor in the virtual canvas (both screens) every time we enter this mode
+    s_cursor_x = (VIRTUAL_W - CURSOR_W) / 2;
+    s_cursor_y = (LCD_V_RES - CURSOR_H) / 2;
+
+    int prev_cx = -1, prev_cy = -1; // force a full redraw on first iteration
+
+    while (s_display_mode == DISPLAY_MODE_WIFI) {
+        int cx = s_cursor_x;
+        int cy = s_cursor_y;
+
+        if (cx == prev_cx && cy == prev_cy) {
+            vTaskDelay(pdMS_TO_TICKS(16)); // ~60 fps check rate; skip if nothing moved
+            continue;
+        }
+
+        // Redraw screen 1 (virtual x 0..239): white + cursor pixels with virtual_x < LCD_H_RES
+        for (int y = 0; y < LCD_V_RES; y++) {
+            memset(line, 0xFF, line_bytes);
+            int row = y - cy;
+            if (row >= 0 && row < CURSOR_H) {
+                uint16_t mask = s_arrow_bitmap[row];
+                for (int bit = 0; bit < 16; bit++) {
+                    if (mask & (1u << (15 - bit))) {
+                        int vx = cx + bit; // virtual x
+                        if (vx >= 0 && vx < LCD_H_RES)
+                            line[vx] = 0x0000;
+                    }
+                }
+            }
+            esp_lcd_panel_draw_bitmap(s_panel1, 0, y, LCD_H_RES, y + 1, line);
+        }
+
+        // Redraw screen 2 (virtual x 240..479): white + cursor pixels with virtual_x >= LCD_H_RES
+        for (int y = 0; y < LCD_V_RES; y++) {
+            memset(line, 0xFF, line_bytes);
+            int row = y - cy;
+            if (row >= 0 && row < CURSOR_H) {
+                uint16_t mask = s_arrow_bitmap[row];
+                for (int bit = 0; bit < 16; bit++) {
+                    if (mask & (1u << (15 - bit))) {
+                        int vx = cx + bit;           // virtual x
+                        int s2x = vx - LCD_H_RES;    // screen-2-local x
+                        if (s2x >= 0 && s2x < LCD_H_RES)
+                            line[s2x] = 0x0000;
+                    }
+                }
+            }
+            esp_lcd_panel_draw_bitmap(s_panel2, 0, y, LCD_H_RES, y + 1, line);
+        }
+
+        prev_cx = cx;
+        prev_cy = cy;
+    }
+
+    heap_caps_free(line);
+}
+
 // -------------------- Display sequence --------------------
 // Edit this table to configure what plays on which screen and for how long.
 static const scene_t s_display_sequence[] = {
@@ -291,10 +497,18 @@ void app_main(void)
     // Initialise LCD panels
     lcd_init();
 
-    // Run the display sequence (loops forever)
+    // Run the display loop (loops forever)
     while (1) {
-        display_sequence_run(s_panel1, s_panel2,
-                             s_display_sequence,
-                             sizeof(s_display_sequence) / sizeof(s_display_sequence[0]));
+        switch (s_display_mode) {
+            case DISPLAY_MODE_WIFI:
+                display_white_screens();
+                break;
+            case DISPLAY_MODE_NORMAL:
+            default:
+                display_sequence_run(s_panel1, s_panel2,
+                                     s_display_sequence,
+                                     sizeof(s_display_sequence) / sizeof(s_display_sequence[0]));
+                break;
+        }
     }
 }
