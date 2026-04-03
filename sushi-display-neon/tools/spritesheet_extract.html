@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Spritesheet → RGB565 .bin for ESP32/ST7789</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; background: #fafafa; }
+    h2   { margin-bottom: 4px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; margin-top: 12px; }
+
+    .card {
+      border: 1px solid #ddd; border-radius: 10px; padding: 14px;
+      background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    }
+    label        { display: block; margin: 10px 0 3px; font-size: 13px; font-weight: 600; }
+    label.inline { display: inline-flex; align-items: center; gap: 5px; font-weight: normal; cursor: pointer; }
+    input[type="number"] { width: 72px; padding: 4px 6px; border: 1px solid #ccc; border-radius: 6px; }
+    input[type="text"]   { width: 180px; padding: 4px 6px; border: 1px solid #ccc; border-radius: 6px; }
+    input[type="color"]  { width: 42px; height: 30px; border: 1px solid #ccc; border-radius: 6px; cursor: pointer; padding: 2px; }
+    .grid { display: grid; grid-template-columns: 110px auto; gap: 5px 10px; align-items: center; font-size: 13px; }
+    .small { font-size: 12px; color: #555; line-height: 1.45; margin: 3px 0; }
+    .muted { color: #888; }
+
+    button {
+      padding: 8px 14px; border-radius: 8px; border: 1px solid #bbb;
+      background: #f0f0f0; cursor: pointer; font-size: 13px; transition: background .1s;
+    }
+    button:hover:not(:disabled) { background: #e0e0e0; }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    button.primary  { background: #4a90d9; color: #fff; border-color: #3070b9; }
+    button.primary:hover:not(:disabled) { background: #3b80c9; }
+
+    .progress-bar  { height: 8px; background: #eee; border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
+    .progress-fill { height: 100%; background: #4a90d9; border-radius: 4px; width: 0%; transition: width .1s linear; }
+
+    /* Sheet canvas */
+    #sheetWrap { overflow: auto; max-width: 100%; max-height: 520px;
+                 border: 1px solid #ccc; border-radius: 6px; background: #333; }
+    #sheetCanvas { display: block; image-rendering: pixelated; cursor: crosshair; }
+
+    /* Animation list */
+    .anim-list { max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; }
+    .anim-item {
+      border: 1px solid #ddd; border-radius: 7px; padding: 8px 10px;
+      cursor: pointer; transition: background .1s;
+    }
+    .anim-item:hover    { background: #f0f8ff; }
+    .anim-item.selected { background: #e4f1fd; border-color: #4a90d9; }
+    .anim-item strong   { font-size: 13px; }
+    .anim-item .meta    { font-size: 11px; color: #666; margin-top: 2px; }
+
+    /* Frame strip */
+    .frame-strip      { display: flex; flex-wrap: wrap; gap: 3px; background: #222;
+                        padding: 6px; border-radius: 6px; max-height: 280px; overflow-y: auto; }
+    .frame-strip span { position: relative; display: block; }
+    .frame-strip span canvas { display: block; image-rendering: pixelated; border-radius: 2px; }
+    .frame-strip span em {
+      position: absolute; bottom: 1px; left: 2px;
+      font-size: 9px; font-style: normal;
+      background: rgba(0,0,0,.65); color: #fff; padding: 0 3px; border-radius: 2px;
+    }
+
+    /* Preview */
+    #previewCanvas { display: block; image-rendering: pixelated; border: 1px solid #aaa;
+                     background: repeating-conic-gradient(#ccc 0% 25%, #eee 0% 50%)
+                                 0 0 / 16px 16px; }
+    .playbar { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+
+    hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    .tip { background: #fff8e1; border-left: 3px solid #ffc107; padding: 6px 10px;
+           border-radius: 0 6px 6px 0; font-size: 12px; margin: 8px 0; }
+  </style>
+</head>
+
+<body>
+<h2>Spritesheet → packed RGB565 <code>.bin</code> for ESP32&nbsp;/&nbsp;ST7789</h2>
+<p class="small">
+  Extracts animation strips from a sprite sheet and exports them as <code>.bin</code> animation files
+  compatible with the ESP32 display project.<br>
+  The background colour is auto-detected from the top-left corner and treated as transparent.
+  Click any pixel on the sheet to pick a new background colour.
+</p>
+<div class="tip">
+  <strong>Tip:</strong> After loading, click <em>Scan</em> to detect all animation rows.
+  Select one from the list, adjust Scale / FPS / Output size, then click <em>Export&nbsp;.bin</em>.
+</div>
+
+<div class="row">
+
+  <!-- ── Left panel: controls ─────────────────────────────────────────────── -->
+  <div class="card" style="min-width:280px; max-width:320px;">
+
+    <label>1) Load sprite sheet</label>
+    <input id="fileInput" type="file" accept="image/*" />
+    <p class="small muted" id="fileInfo">PNG, GIF, BMP — any browser-readable image.</p>
+
+    <hr/>
+
+    <label>Background colour <span class="small muted">(click sheet to eyedrop)</span></label>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <input id="bgColor"     type="color" value="#00b8d8" title="Background colour" />
+      <input id="bgTolerance" type="number" value="35" min="0" max="200" title="Colour tolerance (Manhattan)" />
+      <span class="small">tolerance</span>
+    </div>
+
+    <label>Min strip height (px)</label>
+    <input id="minStripH" type="number" value="8" min="1" max="200" />
+    <p class="small">Strips with fewer rows (e.g. label bars) are discarded.</p>
+
+    <label>Min frame width (px)</label>
+    <input id="minFrameW" type="number" value="4" min="1" max="200" />
+
+    <div style="margin-top:12px;">
+      <button id="btnScan" class="primary" disabled>Scan for animations</button>
+    </div>
+    <p class="small" id="scanStatus" style="margin-top:8px;"></p>
+
+    <hr/>
+
+    <label>3) Export settings</label>
+    <div class="grid">
+      <span>FPS</span>
+      <input id="outFps" type="number" value="12" min="1" max="120" />
+      <span>Scale ×</span>
+      <input id="outScale" type="number" value="4" min="1" max="32" />
+      <span>Output W</span>
+      <input id="outW" type="number" value="240" min="1" max="1920" />
+      <span>Output H</span>
+      <input id="outH" type="number" value="320" min="1" max="1920" />
+    </div>
+    <label class="inline"><input id="centerOutput" type="checkbox" checked /> Centre sprite in output frame</label>
+    <label>Background fill colour</label>
+    <input id="fillColor" type="color" value="#000000" />
+    <label>Output filename</label>
+    <input id="outName" type="text" value="kirby_anim" />
+    <p class="small muted">→ <span id="outNamePreview">kirby_anim_240x320.bin</span></p>
+    <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button id="btnExport" class="primary" disabled>Export .bin</button>
+      <button id="btnExportAll" disabled>Export all .bin</button>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <p class="small" id="exportStatus"></p>
+  </div>
+
+  <!-- ── Centre panel: sheet preview ─────────────────────────────────────── -->
+  <div class="card" style="flex:2; min-width:300px;">
+    <p class="small" style="margin:0 0 6px;"><strong>Sprite sheet</strong>
+      <span class="muted">(highlighted strips = detected animations; click to eyedrop BG colour)</span></p>
+    <div id="sheetWrap">
+      <canvas id="sheetCanvas"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<div class="row">
+
+  <!-- ── Animation list ───────────────────────────────────────────────────── -->
+  <div class="card" style="min-width:210px; max-width:260px;">
+    <p class="small" style="margin:0 0 6px;"><strong>2) Detected animations</strong></p>
+    <div class="anim-list" id="animList">
+      <p class="small muted">Scan the sheet first.</p>
+    </div>
+  </div>
+
+  <!-- ── Preview ──────────────────────────────────────────────────────────── -->
+  <div class="card" style="flex:1; min-width:280px;">
+    <p class="small" style="margin:0 0 6px;"><strong>Animation preview</strong></p>
+    <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+
+      <div>
+        <canvas id="previewCanvas" width="120" height="160"></canvas>
+        <div class="playbar">
+          <button id="btnPlay"  disabled>▶</button>
+          <button id="btnStop"  disabled>■</button>
+          <button id="btnPrev"  disabled>◀</button>
+          <button id="btnNext"  disabled>▶▶</button>
+          <span class="small" id="frameInfo"></span>
+        </div>
+      </div>
+
+      <div style="flex:1; min-width:200px;">
+        <p class="small" style="margin:0 0 4px;">All frames (3× zoom):</p>
+        <div class="frame-strip" id="frameStrip">
+          <p class="small muted" style="padding:4px;">Select an animation.</p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+
+<!-- Hidden work canvas -->
+<canvas id="workCanvas" style="display:none;"></canvas>
+
+<script>
+(() => {
+  'use strict';
+
+  // ── DOM refs ───────────────────────────────────────────────────────────────
+  const fileInputEl    = document.getElementById('fileInput');
+  const fileInfoEl     = document.getElementById('fileInfo');
+  const bgColorEl      = document.getElementById('bgColor');
+  const bgToleranceEl  = document.getElementById('bgTolerance');
+  const minStripHEl    = document.getElementById('minStripH');
+  const minFrameWEl    = document.getElementById('minFrameW');
+  const btnScan        = document.getElementById('btnScan');
+  const scanStatusEl   = document.getElementById('scanStatus');
+  const sheetCanvas    = document.getElementById('sheetCanvas');
+  const sheetCtx       = sheetCanvas.getContext('2d', { willReadFrequently: true });
+  const workCanvas     = document.getElementById('workCanvas');
+  const workCtx        = workCanvas.getContext('2d', { willReadFrequently: true });
+  const animListEl     = document.getElementById('animList');
+  const frameStripEl   = document.getElementById('frameStrip');
+  const previewCanvas  = document.getElementById('previewCanvas');
+  const previewCtx     = previewCanvas.getContext('2d');
+  const outFpsEl       = document.getElementById('outFps');
+  const outScaleEl     = document.getElementById('outScale');
+  const outWEl         = document.getElementById('outW');
+  const outHEl         = document.getElementById('outH');
+  const centerOutputEl = document.getElementById('centerOutput');
+  const fillColorEl    = document.getElementById('fillColor');
+  const outNameEl      = document.getElementById('outName');
+  const outNamePrevEl  = document.getElementById('outNamePreview');
+  const btnExport      = document.getElementById('btnExport');
+  const btnExportAll   = document.getElementById('btnExportAll');
+  const progressFill   = document.getElementById('progressFill');
+  const exportStatusEl = document.getElementById('exportStatus');
+  const frameInfoEl    = document.getElementById('frameInfo');
+  const btnPlay        = document.getElementById('btnPlay');
+  const btnStop        = document.getElementById('btnStop');
+  const btnPrev        = document.getElementById('btnPrev');
+  const btnNext        = document.getElementById('btnNext');
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let srcImg       = null;   // HTMLImageElement
+  let srcData      = null;   // ImageData (full resolution, RGBA)
+  let detectedAnims = [];    // [{y1,y2, frames:[{x,y,w,h}]}]
+  let selectedIdx  = -1;
+  let playTimer    = null;
+  let playFrame    = 0;
+
+  // ── Utilities ──────────────────────────────────────────────────────────────
+  const hexToRgb  = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+  const rgbToHex  = (r,g,b) => '#' + [r,g,b].map(v => v.toString(16).padStart(2,'0')).join('');
+  const clamp     = (v,lo,hi) => Math.max(lo, Math.min(hi, v));
+  const yield_    = () => new Promise(r => setTimeout(r, 0));
+
+  const toRGB565  = (r,g,b) => (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)) & 0xFFFF;
+
+  function isBg(r, g, b, br, bg_, bb, tol) {
+    return (Math.abs(r - br) + Math.abs(g - bg_) + Math.abs(b - bb)) <= tol;
+  }
+
+  // Update the filename preview string
+  function updateNamePreview() {
+    const n = outNameEl.value.replace(/[/\\:*?"<>|]/g,'_') || 'anim';
+    outNamePrevEl.textContent = `${n}_${outWEl.value}x${outHEl.value}.bin`;
+  }
+  [outNameEl, outWEl, outHEl].forEach(el => el.addEventListener('input', updateNamePreview));
+  updateNamePreview();
+
+  // ── File load ──────────────────────────────────────────────────────────────
+  fileInputEl.addEventListener('change', async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    stopPlay();
+    detectedAnims = []; selectedIdx = -1;
+    btnScan.disabled = true;
+    btnExport.disabled = true; btnExportAll.disabled = true;
+    scanStatusEl.textContent = 'Loading image…';
+
+    const url = URL.createObjectURL(file);
+    try {
+      srcImg = await loadImage(url);
+    } catch {
+      scanStatusEl.textContent = 'Failed to load image.';
+      return;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+
+    const W = srcImg.naturalWidth, H = srcImg.naturalHeight;
+    fileInfoEl.textContent = `${file.name} — ${W}×${H}px (${(file.size/1024).toFixed(1)} KB)`;
+
+    // Read full-res pixels
+    workCanvas.width = W; workCanvas.height = H;
+    workCtx.drawImage(srcImg, 0, 0);
+    srcData = workCtx.getImageData(0, 0, W, H);
+
+    // Auto-detect background from top-left pixel
+    const [br, bg_, bb] = [srcData.data[0], srcData.data[1], srcData.data[2]];
+    bgColorEl.value = rgbToHex(br, bg_, bb);
+
+    // Draw preview (scale to max 900px wide)
+    const scale = Math.min(1, 900 / W);
+    sheetCanvas.width  = Math.round(W * scale);
+    sheetCanvas.height = Math.round(H * scale);
+    sheetCtx.imageSmoothingEnabled = false;
+    sheetCtx.drawImage(srcImg, 0, 0, sheetCanvas.width, sheetCanvas.height);
+
+    btnScan.disabled = false;
+    scanStatusEl.textContent = `Ready — auto-detected background ${bgColorEl.value}. Click Scan.`;
+  });
+
+  function loadImage(url) {
+    return new Promise((res, rej) => {
+      const img = new Image();
+      img.onload  = () => res(img);
+      img.onerror = () => rej(new Error('Image decode failed'));
+      img.src = url;
+    });
+  }
+
+  // ── Eyedropper (click on sheet canvas) ────────────────────────────────────
+  sheetCanvas.addEventListener('click', e => {
+    if (!srcData) return;
+    const rect  = sheetCanvas.getBoundingClientRect();
+    const sx    = (e.clientX - rect.left) / rect.width  * sheetCanvas.width;
+    const sy    = (e.clientY - rect.top)  / rect.height * sheetCanvas.height;
+    // Map from sheet-canvas coords to full-res coords
+    const px    = Math.floor(sx / sheetCanvas.width  * srcImg.naturalWidth);
+    const py    = Math.floor(sy / sheetCanvas.height * srcImg.naturalHeight);
+    if (px < 0 || py < 0 || px >= srcData.width || py >= srcData.height) return;
+    const i = (py * srcData.width + px) * 4;
+    bgColorEl.value = rgbToHex(srcData.data[i], srcData.data[i+1], srcData.data[i+2]);
+    scanStatusEl.textContent = `Background set to ${bgColorEl.value} — click Scan again.`;
+  });
+
+  // ── Scan ───────────────────────────────────────────────────────────────────
+  btnScan.addEventListener('click', async () => {
+    stopPlay();
+    btnScan.disabled = true;
+    detectedAnims = []; selectedIdx = -1;
+    animListEl.innerHTML = '<p class="small muted">Scanning…</p>';
+    frameStripEl.innerHTML = '';
+    btnExport.disabled = true; btnExportAll.disabled = true;
+    await yield_();
+
+    const [bgR, bgG, bgB] = hexToRgb(bgColorEl.value);
+    const tol   = parseInt(bgToleranceEl.value) || 35;
+    const minH  = parseInt(minStripHEl.value)   || 8;
+    const minW  = parseInt(minFrameWEl.value)   || 4;
+    const imgW  = srcData.width;
+    const imgH  = srcData.height;
+    const d     = srcData.data;
+
+    // ── 1. Mark rows that contain at least one non-background, opaque pixel ──
+    const rowHasFg = new Uint8Array(imgH);
+    for (let y = 0; y < imgH; y++) {
+      const base = y * imgW * 4;
+      for (let x = 0; x < imgW; x++) {
+        const i = base + x * 4;
+        if (d[i+3] >= 200 && !isBg(d[i], d[i+1], d[i+2], bgR, bgG, bgB, tol)) {
+          rowHasFg[y] = 1; break;
+        }
+      }
+    }
+
+    // ── 2. Find strips (runs of content rows) ─────────────────────────────
+    const strips = [];
+    let inStrip = false, stripStart = 0;
+    for (let y = 0; y <= imgH; y++) {
+      if (y < imgH && rowHasFg[y]) {
+        if (!inStrip) { inStrip = true; stripStart = y; }
+      } else {
+        if (inStrip) {
+          inStrip = false;
+          const h = y - stripStart;
+          if (h >= minH) strips.push({ y1: stripStart, y2: y - 1 });
+        }
+      }
+    }
+
+    scanStatusEl.textContent = `Found ${strips.length} strip(s). Detecting frames…`;
+    await yield_();
+
+    // ── 3. For each strip, find horizontal frame boundaries ────────────────
+    for (const strip of strips) {
+      const colHasFg = new Uint8Array(imgW);
+      for (let x = 0; x < imgW; x++) {
+        for (let y = strip.y1; y <= strip.y2; y++) {
+          const i = (y * imgW + x) * 4;
+          if (d[i+3] >= 200 && !isBg(d[i], d[i+1], d[i+2], bgR, bgG, bgB, tol)) {
+            colHasFg[x] = 1; break;
+          }
+        }
+      }
+
+      const frames = [];
+      let inSeg = false, segX0 = 0;
+      for (let x = 0; x <= imgW; x++) {
+        if (x < imgW && colHasFg[x]) {
+          if (!inSeg) { inSeg = true; segX0 = x; }
+        } else {
+          if (inSeg) {
+            inSeg = false;
+            const segW = x - segX0;
+            if (segW >= minW) {
+              // Tight vertical bounding box within segment
+              let minY = strip.y2, maxY = strip.y1;
+              for (let sy = strip.y1; sy <= strip.y2; sy++) {
+                for (let sx = segX0; sx < x; sx++) {
+                  const i = (sy * imgW + sx) * 4;
+                  if (d[i+3] >= 200 && !isBg(d[i], d[i+1], d[i+2], bgR, bgG, bgB, tol)) {
+                    if (sy < minY) minY = sy;
+                    if (sy > maxY) maxY = sy;
+                  }
+                }
+              }
+              // Tight horizontal bounding box within segment
+              let minX = x - 1, maxX = segX0;
+              for (let sx = segX0; sx < x; sx++) {
+                for (let sy = strip.y1; sy <= strip.y2; sy++) {
+                  const i = (sy * imgW + sx) * 4;
+                  if (d[i+3] >= 200 && !isBg(d[i], d[i+1], d[i+2], bgR, bgG, bgB, tol)) {
+                    if (sx < minX) minX = sx;
+                    if (sx > maxX) maxX = sx;
+                  }
+                }
+              }
+              frames.push({
+                x: minX, y: minY,
+                w: maxX - minX + 1,
+                h: maxY - minY + 1,
+              });
+            }
+          }
+        }
+      }
+
+      if (frames.length > 0) {
+        detectedAnims.push({ y1: strip.y1, y2: strip.y2, frames });
+      }
+    }
+
+    scanStatusEl.textContent =
+      `Detected ${detectedAnims.length} animation(s) across ${strips.length} strip(s).`;
+
+    redrawSheet();
+    populateAnimList();
+    btnScan.disabled = false;
+  });
+
+  // ── Sheet overlay ──────────────────────────────────────────────────────────
+  const STRIP_COLORS = [
+    'rgba(255,60,60,.35)',  'rgba(60,200,60,.35)',  'rgba(60,120,255,.35)',
+    'rgba(255,160,0,.35)',  'rgba(180,0,200,.35)',  'rgba(0,180,180,.35)',
+    'rgba(200,200,0,.35)',  'rgba(255,100,160,.35)',
+  ];
+
+  function redrawSheet() {
+    if (!srcImg) return;
+    const scaleX = sheetCanvas.width  / srcImg.naturalWidth;
+    const scaleY = sheetCanvas.height / srcImg.naturalHeight;
+    sheetCtx.imageSmoothingEnabled = false;
+    sheetCtx.drawImage(srcImg, 0, 0, sheetCanvas.width, sheetCanvas.height);
+    detectedAnims.forEach((anim, i) => {
+      sheetCtx.fillStyle = STRIP_COLORS[i % STRIP_COLORS.length];
+      const sy1 = Math.floor(anim.y1 * scaleY);
+      const sy2 = Math.ceil((anim.y2 + 1) * scaleY);
+      sheetCtx.fillRect(0, sy1, sheetCanvas.width, sy2 - sy1);
+      // Draw frame boundary ticks
+      sheetCtx.strokeStyle = STRIP_COLORS[i % STRIP_COLORS.length].replace('.35', '.8');
+      sheetCtx.lineWidth = 1;
+      anim.frames.forEach(f => {
+        const fx1 = Math.floor(f.x * scaleX);
+        const fx2 = Math.ceil((f.x + f.w) * scaleX);
+        sheetCtx.strokeRect(fx1, sy1, fx2 - fx1, sy2 - sy1);
+      });
+    });
+  }
+
+  // ── Animation list ─────────────────────────────────────────────────────────
+  function populateAnimList() {
+    animListEl.innerHTML = '';
+    if (!detectedAnims.length) {
+      animListEl.innerHTML = '<p class="small muted">No animations found.<br>Try adjusting background colour or tolerance.</p>';
+      return;
+    }
+    detectedAnims.forEach((anim, i) => {
+      const maxW = Math.max(...anim.frames.map(f => f.w));
+      const maxH = Math.max(...anim.frames.map(f => f.h));
+      const div = document.createElement('div');
+      div.className = 'anim-item';
+      div.innerHTML =
+        `<strong>Anim ${i + 1}</strong>` +
+        `<div class="meta">${anim.frames.length} frame(s) &nbsp;·&nbsp; max ${maxW}×${maxH}px` +
+        `<br>rows ${anim.y1}–${anim.y2}</div>`;
+      div.addEventListener('click', () => selectAnim(i));
+      animListEl.appendChild(div);
+    });
+    if (detectedAnims.length > 0) btnExportAll.disabled = false;
+  }
+
+  // ── Select animation ───────────────────────────────────────────────────────
+  function selectAnim(idx) {
+    stopPlay();
+    selectedIdx = idx;
+    document.querySelectorAll('.anim-item').forEach((el, i) =>
+      el.classList.toggle('selected', i === idx));
+
+    const anim = detectedAnims[idx];
+    frameStripEl.innerHTML = '';
+
+    const THUMB = 3;
+    const maxW  = Math.max(...anim.frames.map(f => f.w));
+    const maxH  = Math.max(...anim.frames.map(f => f.h));
+
+    anim.frames.forEach((f, fi) => {
+      const wrap = document.createElement('span');
+      const fc   = document.createElement('canvas');
+      fc.width  = maxW * THUMB;
+      fc.height = maxH * THUMB;
+      const fctx = fc.getContext('2d');
+      fctx.imageSmoothingEnabled = false;
+      // Replace background pixels in the thumbnail
+      const tmpC = makeSpriteCanvas(f, maxW, maxH, 1);
+      fctx.drawImage(tmpC, 0, 0, maxW * THUMB, maxH * THUMB);
+      const lbl = document.createElement('em');
+      lbl.textContent = fi + 1;
+      wrap.appendChild(fc);
+      wrap.appendChild(lbl);
+      frameStripEl.appendChild(wrap);
+    });
+
+    const scale = parseInt(outScaleEl.value) || 4;
+    outWEl.value = maxW * scale;
+    outHEl.value = maxH * scale;
+    outNameEl.value = `kirby_anim${idx + 1}`;
+    updateNamePreview();
+    playFrame = 0;
+    drawPreviewFrame(0);
+    [btnPlay, btnStop, btnPrev, btnNext, btnExport].forEach(b => b.disabled = false);
+  }
+
+  // Build a canvas with bg pixels replaced by the fill colour (1:1 scale)
+  function makeSpriteCanvas(frame, cellW, cellH, scale) {
+    const [bgR, bgG, bgB] = hexToRgb(bgColorEl.value);
+    const [fillR, fillG, fillB] = hexToRgb(fillColorEl.value);
+    const tol = parseInt(bgToleranceEl.value) || 35;
+
+    const tmp = document.createElement('canvas');
+    tmp.width  = frame.w; tmp.height = frame.h;
+    const tctx = tmp.getContext('2d', { willReadFrequently: true });
+    tctx.drawImage(srcImg, frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
+    const px = tctx.getImageData(0, 0, frame.w, frame.h);
+    for (let i = 0; i < px.data.length; i += 4) {
+      if (px.data[i+3] < 200 || isBg(px.data[i], px.data[i+1], px.data[i+2], bgR, bgG, bgB, tol)) {
+        px.data[i]   = fillR;
+        px.data[i+1] = fillG;
+        px.data[i+2] = fillB;
+        px.data[i+3] = 255;
+      } else {
+        px.data[i+3] = 255;
+      }
+    }
+    tctx.putImageData(px, 0, 0);
+    return tmp; // frame.w × frame.h canvas
+  }
+
+  // ── Preview ────────────────────────────────────────────────────────────────
+  function drawPreviewFrame(fi) {
+    if (selectedIdx < 0) return;
+    const anim   = detectedAnims[selectedIdx];
+    const frames = anim.frames;
+    const f      = frames[fi];
+    const outW   = parseInt(outWEl.value) || 240;
+    const outH   = parseInt(outHEl.value) || 320;
+    const scale  = parseInt(outScaleEl.value) || 4;
+    const center = centerOutputEl.checked;
+    const maxW   = Math.max(...frames.map(fr => fr.w));
+    const maxH   = Math.max(...frames.map(fr => fr.h));
+
+    previewCanvas.width  = outW;
+    previewCanvas.height = outH;
+    previewCtx.fillStyle = fillColorEl.value;
+    previewCtx.fillRect(0, 0, outW, outH);
+    previewCtx.imageSmoothingEnabled = false;
+
+    const sprite = makeSpriteCanvas(f, maxW, maxH, 1);
+    const dstW   = f.w * scale;
+    const dstH   = f.h * scale;
+    let dx = 0, dy = 0;
+    if (center) {
+      dx = Math.floor((outW - maxW * scale) / 2) + Math.floor((maxW - f.w) / 2) * scale;
+      dy = Math.floor((outH - maxH * scale) / 2) + Math.floor((maxH - f.h) / 2) * scale;
+    }
+    previewCtx.drawImage(sprite, 0, 0, f.w, f.h, dx, dy, dstW, dstH);
+
+    frameInfoEl.textContent = `Frame ${fi + 1} / ${frames.length}  (${f.w}×${f.h}px)`;
+  }
+
+  btnPlay.addEventListener('click', () => {
+    stopPlay();
+    if (selectedIdx < 0) return;
+    const fps = parseInt(outFpsEl.value) || 12;
+    playTimer = setInterval(() => {
+      playFrame = (playFrame + 1) % detectedAnims[selectedIdx].frames.length;
+      drawPreviewFrame(playFrame);
+    }, 1000 / fps);
+  });
+  btnStop.addEventListener('click', stopPlay);
+  btnPrev.addEventListener('click', () => {
+    if (selectedIdx < 0) return;
+    stopPlay();
+    playFrame = (playFrame - 1 + detectedAnims[selectedIdx].frames.length) % detectedAnims[selectedIdx].frames.length;
+    drawPreviewFrame(playFrame);
+  });
+  btnNext.addEventListener('click', () => {
+    if (selectedIdx < 0) return;
+    stopPlay();
+    playFrame = (playFrame + 1) % detectedAnims[selectedIdx].frames.length;
+    drawPreviewFrame(playFrame);
+  });
+
+  function stopPlay() {
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  }
+
+  // Refresh preview when output params change
+  [outFpsEl, outScaleEl, outWEl, outHEl, centerOutputEl, fillColorEl].forEach(el =>
+    el.addEventListener('change', () => { if (selectedIdx >= 0) drawPreviewFrame(playFrame); }));
+
+  // ── Export single animation ────────────────────────────────────────────────
+  btnExport.addEventListener('click', async () => {
+    if (selectedIdx < 0) return;
+    const name = outNameEl.value.replace(/[/\\:*?"<>|]/g,'_') || 'kirby_anim';
+    await exportAnim(detectedAnims[selectedIdx], name);
+  });
+
+  // ── Export all animations ──────────────────────────────────────────────────
+  btnExportAll.addEventListener('click', async () => {
+    btnExportAll.disabled = true;
+    btnExport.disabled = true;
+    const baseName = outNameEl.value.replace(/[/\\:*?"<>|]/g,'_') || 'kirby_anim';
+    for (let i = 0; i < detectedAnims.length; i++) {
+      exportStatusEl.textContent = `Exporting animation ${i+1}/${detectedAnims.length}…`;
+      await exportAnim(detectedAnims[i], `${baseName}${i+1}`, false);
+      await yield_();
+    }
+    exportStatusEl.textContent = `All ${detectedAnims.length} animations exported.`;
+    progressFill.style.width = '100%';
+    btnExportAll.disabled = false;
+    if (selectedIdx >= 0) btnExport.disabled = false;
+  });
+
+  async function exportAnim(anim, baseName, reportStatus = true) {
+    if (reportStatus) {
+      btnExport.disabled = true;
+      exportStatusEl.textContent = 'Exporting…';
+      progressFill.style.width = '0%';
+    }
+
+    const frames = anim.frames;
+    const fps    = parseInt(outFpsEl.value)   || 12;
+    const scale  = parseInt(outScaleEl.value) || 4;
+    const outW   = parseInt(outWEl.value)     || 240;
+    const outH   = parseInt(outHEl.value)     || 320;
+    const center = centerOutputEl.checked;
+    const maxFW  = Math.max(...frames.map(f => f.w));
+    const maxFH  = Math.max(...frames.map(f => f.h));
+
+    // Binary buffer: 8-byte header + frames
+    const frameBytes = outW * outH * 2;
+    const buf  = new ArrayBuffer(8 + frames.length * frameBytes);
+    const u8   = new Uint8Array(buf);
+    const dv   = new DataView(buf);
+
+    dv.setUint16(0, outW,          true);
+    dv.setUint16(2, outH,          true);
+    dv.setUint16(4, frames.length, true);
+    dv.setUint16(6, fps,           true);
+
+    // Render canvas
+    const rc    = document.createElement('canvas');
+    rc.width    = outW; rc.height = outH;
+    const rctx  = rc.getContext('2d', { willReadFrequently: true });
+    rctx.imageSmoothingEnabled = false;
+
+    for (let fi = 0; fi < frames.length; fi++) {
+      const f = frames[fi];
+
+      rctx.fillStyle = fillColorEl.value;
+      rctx.fillRect(0, 0, outW, outH);
+
+      const sprite = makeSpriteCanvas(f, maxFW, maxFH, 1);
+      const dstW   = f.w * scale;
+      const dstH   = f.h * scale;
+      let dx = 0, dy = 0;
+      if (center) {
+        dx = Math.floor((outW - maxFW * scale) / 2) + Math.floor((maxFW - f.w) / 2) * scale;
+        dy = Math.floor((outH - maxFH * scale) / 2) + Math.floor((maxFH - f.h) / 2) * scale;
+      }
+      rctx.drawImage(sprite, 0, 0, f.w, f.h, dx, dy, dstW, dstH);
+
+      // Convert to big-endian RGB565
+      const imgData = rctx.getImageData(0, 0, outW, outH);
+      const pix     = imgData.data;
+      const base    = 8 + fi * frameBytes;
+      for (let p = 0; p < outW * outH; p++) {
+        const v = toRGB565(pix[p*4], pix[p*4+1], pix[p*4+2]);
+        u8[base + p*2]     = (v >> 8) & 0xFF;  // high byte first (big-endian for ST7789)
+        u8[base + p*2 + 1] =  v       & 0xFF;
+      }
+
+      const frac = (fi + 1) / frames.length;
+      progressFill.style.width = (frac * 100).toFixed(1) + '%';
+      if (fi % 4 === 3) await yield_();
+    }
+
+    const fname = `${baseName}_${outW}x${outH}.bin`;
+    triggerDownload(buf, fname);
+    const kb = (buf.byteLength / 1024).toFixed(1);
+
+    if (reportStatus) {
+      exportStatusEl.textContent =
+        `Saved "${fname}" — ${frames.length} frame(s), ${outW}×${outH}, ${kb} KB`;
+      btnExport.disabled = false;
+    }
+  }
+
+  function triggerDownload(buffer, filename) {
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const a    = document.createElement('a');
+    a.href     = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+
+})();
+</script>
+
+</body>
+</html>
