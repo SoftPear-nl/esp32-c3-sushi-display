@@ -35,60 +35,15 @@ typedef enum {
 
 static volatile display_mode_t s_display_mode = DISPLAY_MODE_NORMAL;
 
+// Position of the kirb_walk overlay (top-left corner, in screen pixels).
+// Initialised to centred when the animation loads; adjusted by the 5-way switch.
+static volatile int s_walk_x = 0;
+static volatile int s_walk_y = 0;
+static volatile int s_walk_dir = 1; // 1 = right (default), -1 = left (mirrored)
+
 static const char *s_display_mode_names[] = {
     [DISPLAY_MODE_NORMAL] = "NORMAL",
     [DISPLAY_MODE_WIFI]   = "WIFI",
-};
-
-// -------------------- Cursor (arrow) --------------------
-#define CURSOR_W    9                      // bounding-box width  (cols 0-8)
-#define CURSOR_H   17                      // bounding-box height (rows 0-16)
-#define CURSOR_STEP 10                     // pixels per d-pad press
-#define VIRTUAL_W  (LCD_H_RES * 2)         // total virtual width spanning both screens
-
-static volatile int s_cursor_x = 0;  // set to centre each time WIFI mode opens
-static volatile int s_cursor_y = 0;
-
-/* Standard NW-pointing arrow cursor.
- * 16-bit row bitmasks; bit 15 = leftmost column (col 0), 1 = black pixel.
- *
- *   col: 0 1 2 3 4 5 6 7 8
- *   row 0:  *
- *   row 1:  * *
- *   row 2:  * * *
- *   row 3:  * * * *
- *   row 4:  * * * * *
- *   row 5:  * * * * * *
- *   row 6:  * * * * * * *
- *   row 7:  * * * * * * * *
- *   row 8:  * * * * * * * * *
- *   row 9:  * * * * * *
- *   row10:  * * * . * * *
- *   row11:  * . . . . * * *
- *   row12:  . . . . . * * *
- *   row13:  . . . . . . * * *
- *   row14:  . . . . . . * * *
- *   row15:  . . . . . . . * *
- *   row16:  . . . . . . . * *
- */
-static const uint16_t s_arrow_bitmap[CURSOR_H] = {
-    0x8000, // row  0 – tip
-    0xC000, // row  1
-    0xE000, // row  2
-    0xF000, // row  3
-    0xF800, // row  4
-    0xFC00, // row  5
-    0xFE00, // row  6
-    0xFF00, // row  7
-    0xFF80, // row  8 – widest
-    0xFC00, // row  9 – notch cuts right side
-    0xEE00, // row 10 – gap between head and shaft
-    0x8700, // row 11 – shaft begins
-    0x0700, // row 12
-    0x0380, // row 13
-    0x0380, // row 14
-    0x0180, // row 15
-    0x0180, // row 16
 };
 
 // -------------------- Display config --------------------
@@ -143,64 +98,56 @@ static const struct { int pin; const char *name; } s_5way_buttons[] = {
 };
 #define NUM_5WAY_BUTTONS (sizeof(s_5way_buttons) / sizeof(s_5way_buttons[0]))
 
-#define CURSOR_REPEAT_DELAY_MS  400   // ms before auto-repeat starts
-#define CURSOR_REPEAT_RATE_MS    80   // ms between repeated steps while held
-
-// Move cursor one step for the given pin; call on press and on each repeat tick.
-static void cursor_move(int pin)
-{
-    switch (pin) {
-        case PIN_5WAY_LEFT: {
-            int nx = s_cursor_x - CURSOR_STEP;
-            s_cursor_x = nx < 0 ? 0 : nx;
-            break;
-        }
-        case PIN_5WAY_RIGHT: {
-            int nx = s_cursor_x + CURSOR_STEP;
-            s_cursor_x = nx > VIRTUAL_W - CURSOR_W ? VIRTUAL_W - CURSOR_W : nx;
-            break;
-        }
-        case PIN_5WAY_UP: {
-            int ny = s_cursor_y - CURSOR_STEP;
-            s_cursor_y = ny < 0 ? 0 : ny;
-            break;
-        }
-        case PIN_5WAY_DOWN: {
-            int ny = s_cursor_y + CURSOR_STEP;
-            s_cursor_y = ny > LCD_V_RES - CURSOR_H ? LCD_V_RES - CURSOR_H : ny;
-            break;
-        }
-        default:
-            break;
-    }
-}
+#define HOLD_REPEAT_MS    80  ///< Auto-repeat interval while held in DISPLAY_MODE_WIFI (ms)
 
 static void five_way_switch_task(void *arg)
 {
-    bool     prev[NUM_5WAY_BUTTONS];
-    TickType_t held_since[NUM_5WAY_BUTTONS];
-    TickType_t last_repeat[NUM_5WAY_BUTTONS];
+    bool prev[NUM_5WAY_BUTTONS];
+    int  hold_ms[NUM_5WAY_BUTTONS];
 
     for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++) {
-        prev[i]        = gpio_get_level(s_5way_buttons[i].pin);
-        held_since[i]  = 0;
-        last_repeat[i] = 0;
+        prev[i]    = gpio_get_level(s_5way_buttons[i].pin);
+        hold_ms[i] = 0;
     }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
-        TickType_t now = xTaskGetTickCount();
 
         for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++) {
             bool cur = gpio_get_level(s_5way_buttons[i].pin);
             int  pin = s_5way_buttons[i].pin;
 
-            if (!cur && prev[i]) {
-                // ── Falling edge: first press ────────────────────────────────
-                ESP_LOGI(TAG, "Button pressed: %s", s_5way_buttons[i].name);
-                held_since[i]  = now;
-                last_repeat[i] = now;
+            bool first_press = (!cur &&  prev[i]);
+            bool held        = (!cur && !prev[i]);
 
+            if (first_press) {
+                hold_ms[i] = 0;
+                ESP_LOGI(TAG, "Button pressed: %s", s_5way_buttons[i].name);
+            } else if (held) {
+                hold_ms[i] += 20;
+            } else {
+                hold_ms[i] = 0;
+            }
+
+            // Center: single fire only.
+            // Directional in WIFI mode: fire on first press, then repeat every
+            // HOLD_REPEAT_MS with no initial delay.
+            // Directional in other modes: first press only.
+            bool fire = false;
+            if (pin == PIN_5WAY_CENTER) {
+                fire = first_press;
+            } else if (s_display_mode == DISPLAY_MODE_WIFI) {
+                if (first_press) {
+                    fire = true;
+                } else if (held && hold_ms[i] >= HOLD_REPEAT_MS) {
+                    fire = true;
+                    hold_ms[i] -= HOLD_REPEAT_MS;
+                }
+            } else {
+                fire = first_press;
+            }
+
+            if (fire) {
                 switch (pin) {
                     case PIN_5WAY_CENTER:
                         s_display_mode = (s_display_mode + 1) % DISPLAY_MODE_COUNT;
@@ -211,29 +158,24 @@ static void five_way_switch_task(void *arg)
                     case PIN_5WAY_RIGHT:
                     case PIN_5WAY_UP:
                     case PIN_5WAY_DOWN:
-                        if (s_display_mode == DISPLAY_MODE_WIFI) {
-                            cursor_move(pin);
-                        } else if (s_display_mode == DISPLAY_MODE_NORMAL) {
+                        if (s_display_mode == DISPLAY_MODE_NORMAL) {
                             current_led_mode = (current_led_mode + 1) % LED_MODE_COUNT;
                             ESP_LOGI(TAG, "LED mode -> %s", s_led_mode_names[current_led_mode]);
+                        } else if (s_display_mode == DISPLAY_MODE_WIFI) {
+                            if      (pin == PIN_5WAY_LEFT)  { s_walk_x -= 10; s_walk_dir = -1; }
+                            else if (pin == PIN_5WAY_RIGHT) { s_walk_x += 10; s_walk_dir =  1; }
+                            else if (pin == PIN_5WAY_UP)    s_walk_y -= 10;
+                            else if (pin == PIN_5WAY_DOWN)  s_walk_y += 10;
+                            // Clamp to the virtual two-screen canvas
+                            if (s_walk_x < 0)                  s_walk_x = 0;
+                            if (s_walk_x > 2 * LCD_H_RES - 1) s_walk_x = 2 * LCD_H_RES - 1;
+                            if (s_walk_y < 0)                  s_walk_y = 0;
+                            if (s_walk_y > LCD_V_RES  - 1)     s_walk_y = LCD_V_RES  - 1;
+                            ESP_LOGI(TAG, "walk pos -> x=%d y=%d", s_walk_x, s_walk_y);
                         }
                         break;
                     default:
                         break;
-                }
-
-            } else if (!cur && !prev[i]) {
-                // ── Held: auto-repeat cursor movement in WIFI mode only ───────
-                if (s_display_mode == DISPLAY_MODE_WIFI &&
-                    (pin == PIN_5WAY_LEFT || pin == PIN_5WAY_RIGHT ||
-                     pin == PIN_5WAY_UP   || pin == PIN_5WAY_DOWN)) {
-                    TickType_t held_ms   = (now - held_since[i])  * portTICK_PERIOD_MS;
-                    TickType_t repeat_ms = (now - last_repeat[i]) * portTICK_PERIOD_MS;
-                    if (held_ms  >= CURSOR_REPEAT_DELAY_MS &&
-                        repeat_ms >= CURSOR_REPEAT_RATE_MS) {
-                        cursor_move(pin);
-                        last_repeat[i] = now;
-                    }
                 }
             }
 
@@ -357,72 +299,184 @@ static void lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel2, true));
 }
 
-// -------------------- Display mode: white screens + movable cursor --------------------
+// -------------------- Display mode: kirb_back.bmp + kirb_walk.bin overlay --------------------
 static void display_white_screens(void)
 {
-    const size_t line_bytes = LCD_H_RES * sizeof(uint16_t);
-    uint16_t *line = heap_caps_malloc(line_bytes, MALLOC_CAP_DMA);
-    if (!line) {
-        ESP_LOGE(TAG, "Failed to allocate white line buffer");
-        vTaskDelay(pdMS_TO_TICKS(500));
+    uint16_t *bg1 = NULL;  // 240×LCD_V_RES, left  half → panel 1
+    uint16_t *bg2 = NULL;  // 240×LCD_V_RES, right half → panel 2
+
+    // ── Load and split background ─────────────────────────────────────────────
+    do {
+        FILE *f = fopen("/spiffs/kirb_back.bmp", "rb");
+        if (!f) { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_back.bmp"); break; }
+
+        uint8_t hdr[66];
+        if (fread(hdr, 1, sizeof(hdr), f) < sizeof(hdr) ||
+                hdr[0] != 'B' || hdr[1] != 'M') {
+            ESP_LOGE(TAG, "kirb_back.bmp: bad header");
+            fclose(f); break;
+        }
+
+        uint32_t po     = (uint32_t)(hdr[10] | (hdr[11]<<8) | (hdr[12]<<16) | (hdr[13]<<24));
+        int32_t  w      = (int32_t) (hdr[18] | (hdr[19]<<8) | (hdr[20]<<16) | (hdr[21]<<24));
+        int32_t  h      = (int32_t) (hdr[22] | (hdr[23]<<8) | (hdr[24]<<16) | (hdr[25]<<24));
+        int      width  = w < 0 ? -w : w;
+        int      height = h < 0 ? -h : h;
+        bool     top_down   = h < 0;
+        uint32_t row_stride = ((uint32_t)(width * 2 + 3) / 4) * 4;
+
+        uint16_t *img     = heap_caps_malloc((size_t)width * height * 2,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uint16_t *row_buf = malloc(row_stride);
+        if (!img || !row_buf) {
+            ESP_LOGE(TAG, "kirb_back.bmp: OOM");
+            free(img); free(row_buf); fclose(f); break;
+        }
+
+        fseek(f, (long)po, SEEK_SET);
+        for (int disk_row = 0; disk_row < height; disk_row++) {
+            size_t got = fread(row_buf, 1, row_stride, f);
+            if (got < (size_t)row_stride)
+                memset((uint8_t *)row_buf + got, 0, row_stride - got);
+            int img_row = top_down ? disk_row : (height - 1 - disk_row);
+            uint16_t *dst = img + (size_t)img_row * width;
+            for (int c = 0; c < width; c++) {
+                uint16_t px = row_buf[c];
+                dst[c] = (uint16_t)((px >> 8) | (px << 8)); // LE→BE
+            }
+            if ((disk_row & 15) == 15) vTaskDelay(1);
+        }
+        free(row_buf);
+        fclose(f);
+
+        int bg_rows = height < LCD_V_RES ? height : LCD_V_RES;
+        bg1 = heap_caps_calloc((size_t)LCD_H_RES * LCD_V_RES, 2,
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        bg2 = heap_caps_calloc((size_t)LCD_H_RES * LCD_V_RES, 2,
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (bg1 && bg2) {
+            for (int y = 0; y < bg_rows; y++) {
+                uint16_t *row = img + (size_t)y * width;
+                memcpy(bg1 + (size_t)y * LCD_H_RES, row,             (size_t)LCD_H_RES * 2);
+                memcpy(bg2 + (size_t)y * LCD_H_RES, row + LCD_H_RES, (size_t)LCD_H_RES * 2);
+            }
+        }
+        free(img);
+    } while (0);
+
+    if (!bg1 || !bg2) {
+        ESP_LOGE(TAG, "display_white_screens: failed to load background");
+        free(bg1); free(bg2);
+        while (s_display_mode == DISPLAY_MODE_WIFI)
+            vTaskDelay(pdMS_TO_TICKS(100));
         return;
     }
 
-    // Centre the cursor in the virtual canvas (both screens) every time we enter this mode
-    s_cursor_x = (VIRTUAL_W - CURSOR_W) / 2;
-    s_cursor_y = (LCD_V_RES - CURSOR_H) / 2;
+    // Draw background once
+    esp_lcd_panel_draw_bitmap(s_panel1, 0, 0, LCD_H_RES, LCD_V_RES, bg1);
+    esp_lcd_panel_draw_bitmap(s_panel2, 0, 0, LCD_H_RES, LCD_V_RES, bg2);
 
-    int prev_cx = -1, prev_cy = -1; // force a full redraw on first iteration
+    // ── Animate kirb_walk.bin centred at 3× on top of background ─────────────
+    do {
+        FILE *af = fopen("/spiffs/kirb_walk.bin", "rb");
+        if (!af) { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_walk.bin"); break; }
 
-    while (s_display_mode == DISPLAY_MODE_WIFI) {
-        int cx = s_cursor_x;
-        int cy = s_cursor_y;
+        uint8_t ahdr[8];
+        if (fread(ahdr, 1, 8, af) < 8) {
+            ESP_LOGE(TAG, "kirb_walk.bin: short header"); fclose(af); break;
+        }
+        int     anim_w   = (int)(ahdr[0] | (ahdr[1] << 8));
+        int     anim_h   = (int)(ahdr[2] | (ahdr[3] << 8));
+        int     frames   = (int)(ahdr[4] | (ahdr[5] << 8));
+        int     fps      = (int)(ahdr[6] | (ahdr[7] << 8));
+        int64_t frame_us = (fps > 0) ? (1000000LL / fps) : 100000LL;
+        long    data_ofs = ftell(af);
+        int     sc       = 3;
+        int     out_w    = anim_w * sc;
+        int     out_h    = anim_h * sc;
+        int     draw_w   = out_w < LCD_H_RES ? out_w : LCD_H_RES;
+        int     draw_h   = out_h < LCD_V_RES ? out_h : LCD_V_RES;
+        int     off_x    = (LCD_H_RES - draw_w) / 2;
+        int     off_y    = (LCD_V_RES - draw_h) / 2;
+        s_walk_x = off_x;
+        s_walk_y = off_y;
 
-        if (cx == prev_cx && cy == prev_cy) {
-            vTaskDelay(pdMS_TO_TICKS(16)); // ~60 fps check rate; skip if nothing moved
-            continue;
+        uint16_t *frame_buf = heap_caps_malloc((size_t)anim_w * anim_h * 2,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uint16_t *comp      = heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * 2,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!frame_buf || !comp) {
+            ESP_LOGE(TAG, "kirb_walk: OOM");
+            free(frame_buf); free(comp); fclose(af); break;
         }
 
-        // Redraw screen 1 (virtual x 0..239): white + cursor pixels with virtual_x < LCD_H_RES
-        for (int y = 0; y < LCD_V_RES; y++) {
-            memset(line, 0xFF, line_bytes);
-            int row = y - cy;
-            if (row >= 0 && row < CURSOR_H) {
-                uint16_t mask = s_arrow_bitmap[row];
-                for (int bit = 0; bit < 16; bit++) {
-                    if (mask & (1u << (15 - bit))) {
-                        int vx = cx + bit; // virtual x
-                        if (vx >= 0 && vx < LCD_H_RES)
-                            line[vx] = 0x0000;
+        ESP_LOGI(TAG, "kirb_walk: %dx%d %d frames @%d fps scale=3 off=(%d,%d)",
+                 anim_w, anim_h, frames, fps, off_x, off_y);
+
+        bool io_ok = true;
+        while (io_ok && s_display_mode == DISPLAY_MODE_WIFI) {
+            fseek(af, data_ofs, SEEK_SET);
+            for (int fi = 0; fi < frames && s_display_mode == DISPLAY_MODE_WIFI; fi++) {
+                int64_t t0 = esp_timer_get_time();
+
+                if (fread(frame_buf, 2, (size_t)anim_w * anim_h, af) <
+                        (size_t)(anim_w * anim_h)) { io_ok = false; break; }
+
+                // Composite onto each panel: copy background, then overlay
+                // animation pixels (black = transparent) at 3× nearest-neighbour.
+                // Snapshot position once per frame so both panels are consistent.
+                int cur_x   = s_walk_x;
+                int cur_y   = s_walk_y;
+                int cur_dir = s_walk_dir;
+                for (int panel_idx = 0; panel_idx < 2; panel_idx++) {
+                    uint16_t *bg = (panel_idx == 0) ? bg1 : bg2;
+                    esp_lcd_panel_handle_t panel = (panel_idx == 0) ? s_panel1 : s_panel2;
+                    int panel_origin = panel_idx * LCD_H_RES;
+
+                    memcpy(comp, bg, (size_t)LCD_H_RES * LCD_V_RES * 2);
+
+                    // Each panel renders whatever portion of the sprite's virtual X
+                    // range falls within its own [0, LCD_H_RES) window, so the sprite
+                    // spans both screens smoothly as it crosses the boundary.
+                    for (int src_r = 0; src_r < anim_h; src_r++) {
+                        const uint16_t *src_row = frame_buf + (size_t)src_r * anim_w;
+                        for (int dr = 0; dr < sc; dr++) {
+                            int dst_y = cur_y + src_r * sc + dr;
+                            if ((unsigned)dst_y >= (unsigned)LCD_V_RES) continue;
+                            uint16_t *dst_row = comp + (size_t)dst_y * LCD_H_RES;
+                            for (int src_c = 0; src_c < anim_w; src_c++) {
+                                int read_c = (cur_dir < 0) ? (anim_w - 1 - src_c) : src_c;
+                                uint16_t px = src_row[read_c];
+                                if (px == 0xFF07) continue; // #00FFFF (cyan) = transparent
+                                for (int dc = 0; dc < sc; dc++) {
+                                    int dst_x = cur_x + src_c * sc + dc - panel_origin;
+                                    if ((unsigned)dst_x < (unsigned)LCD_H_RES)
+                                        dst_row[dst_x] = px;
+                                }
+                            }
+                        }
                     }
+
+                    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, comp);
                 }
+
+                int64_t elapsed_us   = esp_timer_get_time() - t0;
+                int64_t remaining_ms = (frame_us - elapsed_us) / 1000;
+                TickType_t ticks = (remaining_ms > 0) ? pdMS_TO_TICKS((uint32_t)remaining_ms) : 0;
+                vTaskDelay(ticks > 0 ? ticks : 1);
             }
-            esp_lcd_panel_draw_bitmap(s_panel1, 0, y, LCD_H_RES, y + 1, line);
         }
 
-        // Redraw screen 2 (virtual x 240..479): white + cursor pixels with virtual_x >= LCD_H_RES
-        for (int y = 0; y < LCD_V_RES; y++) {
-            memset(line, 0xFF, line_bytes);
-            int row = y - cy;
-            if (row >= 0 && row < CURSOR_H) {
-                uint16_t mask = s_arrow_bitmap[row];
-                for (int bit = 0; bit < 16; bit++) {
-                    if (mask & (1u << (15 - bit))) {
-                        int vx = cx + bit;           // virtual x
-                        int s2x = vx - LCD_H_RES;    // screen-2-local x
-                        if (s2x >= 0 && s2x < LCD_H_RES)
-                            line[s2x] = 0x0000;
-                    }
-                }
-            }
-            esp_lcd_panel_draw_bitmap(s_panel2, 0, y, LCD_H_RES, y + 1, line);
-        }
+        free(frame_buf);
+        free(comp);
+        fclose(af);
+    } while (0);
 
-        prev_cx = cx;
-        prev_cy = cy;
-    }
-
-    heap_caps_free(line);
+    free(bg1);
+    free(bg2);
+    // Guard: idle if we exited the animation early (e.g. file error)
+    while (s_display_mode == DISPLAY_MODE_WIFI)
+        vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 // -------------------- Display sequence --------------------
