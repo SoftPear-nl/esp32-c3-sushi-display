@@ -376,100 +376,168 @@ static void display_white_screens(void)
     esp_lcd_panel_draw_bitmap(s_panel1, 0, 0, LCD_H_RES, LCD_V_RES, bg1);
     esp_lcd_panel_draw_bitmap(s_panel2, 0, 0, LCD_H_RES, LCD_V_RES, bg2);
 
-    // ── Animate kirb_walk.bin centred at 3× on top of background ─────────────
+    // ── Animate kirb_walk.bin / kirby_idle.bin / kirb_fly.bin on top of background ──
+    // kirb_fly.bin  : y <= 210
+    // kirb_walk.bin : y >  210 and moving (last button press < 300 ms ago)
+    // kirby_idle.bin: y >  210 and stationary
     do {
-        FILE *af = fopen("/spiffs/kirb_walk.bin", "rb");
-        if (!af) { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_walk.bin"); break; }
+        // Open all three animation files upfront
+        FILE *walk_f = fopen("/spiffs/kirb_walk.bin",  "rb");
+        if (!walk_f) { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_walk.bin"); break; }
+        FILE *fly_f  = fopen("/spiffs/kirb_fly.bin",   "rb");
+        if (!fly_f)  { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_fly.bin");  fclose(walk_f); break; }
+        FILE *idle_f = fopen("/spiffs/kirby_idle.bin", "rb");
+        if (!idle_f) { ESP_LOGE(TAG, "Cannot open /spiffs/kirby_idle.bin"); fclose(walk_f); fclose(fly_f); break; }
 
-        uint8_t ahdr[8];
-        if (fread(ahdr, 1, 8, af) < 8) {
-            ESP_LOGE(TAG, "kirb_walk.bin: short header"); fclose(af); break;
-        }
-        int     anim_w   = (int)(ahdr[0] | (ahdr[1] << 8));
-        int     anim_h   = (int)(ahdr[2] | (ahdr[3] << 8));
-        int     frames   = (int)(ahdr[4] | (ahdr[5] << 8));
-        int     fps      = (int)(ahdr[6] | (ahdr[7] << 8));
-        int64_t frame_us = (fps > 0) ? (1000000LL / fps) : 100000LL;
-        long    data_ofs = ftell(af);
-        int     sc       = 3;
-        int     out_w    = anim_w * sc;
-        int     out_h    = anim_h * sc;
-        int     draw_w   = out_w < LCD_H_RES ? out_w : LCD_H_RES;
-        int     draw_h   = out_h < LCD_V_RES ? out_h : LCD_V_RES;
-        int     off_x    = (LCD_H_RES - draw_w) / 2;
-        int     off_y    = (LCD_V_RES - draw_h) / 2;
-        s_walk_x = off_x;
-        s_walk_y = off_y;
+        // Helper macro: read 8-byte header, return false on failure
+        #define READ_ANIM_HDR(f, w, h, fr, fps_, us_, ofs_) do { \
+            uint8_t _h[8]; \
+            if (fread(_h, 1, 8, (f)) < 8) { ESP_LOGE(TAG, "short header"); goto anim_done; } \
+            (w)   = (int)(_h[0] | (_h[1] << 8)); \
+            (h)   = (int)(_h[2] | (_h[3] << 8)); \
+            (fr)  = (int)(_h[4] | (_h[5] << 8)); \
+            (fps_)= (int)(_h[6] | (_h[7] << 8)); \
+            (us_) = ((fps_) > 0) ? (1000000LL / (fps_)) : 100000LL; \
+            (ofs_)= ftell(f); \
+        } while (0)
 
-        uint16_t *frame_buf = heap_caps_malloc((size_t)anim_w * anim_h * 2,
+        int     walk_w, walk_h, walk_frames, walk_fps;  int64_t walk_us;  long walk_ofs;
+        int     fly_w,  fly_h,  fly_frames,  fly_fps;   int64_t fly_us;   long fly_ofs;
+        int     idle_w, idle_h, idle_frames, idle_fps;  int64_t idle_us;  long idle_ofs;
+        READ_ANIM_HDR(walk_f, walk_w, walk_h, walk_frames, walk_fps, walk_us, walk_ofs);
+        READ_ANIM_HDR(fly_f,  fly_w,  fly_h,  fly_frames,  fly_fps,  fly_us,  fly_ofs);
+        READ_ANIM_HDR(idle_f, idle_w, idle_h, idle_frames, idle_fps, idle_us, idle_ofs);
+        #undef READ_ANIM_HDR
+
+        // Allocate frame buffer large enough for whichever is biggest
+        size_t walk_px = (size_t)walk_w * walk_h;
+        size_t fly_px  = (size_t)fly_w  * fly_h;
+        size_t idle_px = (size_t)idle_w * idle_h;
+        size_t max_px  = walk_px > fly_px ? walk_px : fly_px;
+        if (idle_px > max_px) max_px = idle_px;
+        uint16_t *frame_buf = heap_caps_malloc(max_px * 2,
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         uint16_t *comp      = heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * 2,
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!frame_buf || !comp) {
-            ESP_LOGE(TAG, "kirb_walk: OOM");
-            free(frame_buf); free(comp); fclose(af); break;
+            ESP_LOGE(TAG, "anim: OOM");
+            free(frame_buf); free(comp);
+            goto anim_done;
         }
 
-        ESP_LOGI(TAG, "kirb_walk: %dx%d %d frames @%d fps scale=3 off=(%d,%d)",
-                 anim_w, anim_h, frames, fps, off_x, off_y);
+        int sc = 3;
+        // Centred start position (based on walk animation — both should be same size)
+        int draw_w = (walk_w * sc) < LCD_H_RES ? (walk_w * sc) : LCD_H_RES;
+        int draw_h = (walk_h * sc) < LCD_V_RES ? (walk_h * sc) : LCD_V_RES;
+        s_walk_x = (LCD_H_RES - draw_w) / 2;
+        s_walk_y = 211 ;
 
-        bool io_ok = true;
+        ESP_LOGI(TAG, "walk: %dx%d %d fr @%d fps  fly: %dx%d %d fr @%d fps  idle: %dx%d %d fr @%d fps  scale=3",
+                 walk_w, walk_h, walk_frames, walk_fps,
+                 fly_w,  fly_h,  fly_frames,  fly_fps,
+                 idle_w, idle_h, idle_frames, idle_fps);
+
+        int  walk_fi = 0, fly_fi = 0, idle_fi = 0;
+        bool io_ok   = true;
+        // Timestamp of the last position change (us); initialised to now so we start in walk.
+        int64_t last_move_us  = esp_timer_get_time();
+        int     last_walk_x   = s_walk_x, last_walk_y = s_walk_y;
+        // Idle blink timing: frame 0 = eyes open (3 s), frame 1 = blink (150 ms)
+        static const int64_t IDLE_FRAME_US[] = { 3000000LL, 150000LL };
+        int64_t idle_frame_start_us = esp_timer_get_time();
+
         while (io_ok && s_display_mode == DISPLAY_MODE_WIFI) {
-            fseek(af, data_ofs, SEEK_SET);
-            for (int fi = 0; fi < frames && s_display_mode == DISPLAY_MODE_WIFI; fi++) {
-                int64_t t0 = esp_timer_get_time();
+            int64_t t0    = esp_timer_get_time();
+            int cur_x     = s_walk_x;
+            int cur_y     = s_walk_y;
+            int cur_dir   = s_walk_dir;
 
-                if (fread(frame_buf, 2, (size_t)anim_w * anim_h, af) <
-                        (size_t)(anim_w * anim_h)) { io_ok = false; break; }
+            // Detect movement
+            if (cur_x != last_walk_x || cur_y != last_walk_y) {
+                last_move_us = esp_timer_get_time();
+                last_walk_x  = cur_x;
+                last_walk_y  = cur_y;
+            }
+            bool moving  = (esp_timer_get_time() - last_move_us) < 300000LL; // 300 ms
+            bool use_fly  = (cur_y <= 210);
+            bool use_idle = !use_fly && !moving;
 
-                // Composite onto each panel: copy background, then overlay
-                // animation pixels (black = transparent) at 3× nearest-neighbour.
-                // Snapshot position once per frame so both panels are consistent.
-                int cur_x   = s_walk_x;
-                int cur_y   = s_walk_y;
-                int cur_dir = s_walk_dir;
-                for (int panel_idx = 0; panel_idx < 2; panel_idx++) {
-                    uint16_t *bg = (panel_idx == 0) ? bg1 : bg2;
-                    esp_lcd_panel_handle_t panel = (panel_idx == 0) ? s_panel1 : s_panel2;
-                    int panel_origin = panel_idx * LCD_H_RES;
+            // For the idle animation, advance the frame based on custom per-frame
+            // durations rather than the file's fps field.
+            if (use_idle && (esp_timer_get_time() - idle_frame_start_us) >= IDLE_FRAME_US[idle_fi]) {
+                idle_fi = (idle_fi + 1) % idle_frames;
+                idle_frame_start_us = esp_timer_get_time();
+            }
+            // When switching into idle, reset to frame 0 and restart the timer.
+            static bool prev_use_idle = false;
+            if (use_idle && !prev_use_idle) {
+                idle_fi = 0;
+                idle_frame_start_us = esp_timer_get_time();
+            }
+            prev_use_idle = use_idle;
 
-                    memcpy(comp, bg, (size_t)LCD_H_RES * LCD_V_RES * 2);
+            FILE   *af       = use_fly  ? fly_f       : (use_idle ? idle_f : walk_f);
+            int     anim_w   = use_fly  ? fly_w       : (use_idle ? idle_w : walk_w);
+            int     anim_h   = use_fly  ? fly_h       : (use_idle ? idle_h : walk_h);
+            int     frames   = use_fly  ? fly_frames  : (use_idle ? idle_frames : walk_frames);
+            // Idle uses a fixed short render tick; frame advancement is timer-driven above.
+            int64_t fus      = use_fly  ? fly_us      : (use_idle ? 50000LL : walk_us);
+            long    data_ofs = use_fly  ? fly_ofs     : (use_idle ? idle_ofs : walk_ofs);
+            // Idle: read current idle_fi but do NOT auto-advance here.
+            int     read_fi;
+            int    *fi;
+            if (use_idle) { read_fi = idle_fi; fi = &read_fi; }
+            else          { fi = use_fly ? &fly_fi : &walk_fi; }
 
-                    // Each panel renders whatever portion of the sprite's virtual X
-                    // range falls within its own [0, LCD_H_RES) window, so the sprite
-                    // spans both screens smoothly as it crosses the boundary.
-                    for (int src_r = 0; src_r < anim_h; src_r++) {
-                        const uint16_t *src_row = frame_buf + (size_t)src_r * anim_w;
-                        for (int dr = 0; dr < sc; dr++) {
-                            int dst_y = cur_y + src_r * sc + dr;
-                            if ((unsigned)dst_y >= (unsigned)LCD_V_RES) continue;
-                            uint16_t *dst_row = comp + (size_t)dst_y * LCD_H_RES;
-                            for (int src_c = 0; src_c < anim_w; src_c++) {
-                                int read_c = (cur_dir < 0) ? (anim_w - 1 - src_c) : src_c;
-                                uint16_t px = src_row[read_c];
-                                if (px == 0xFF07) continue; // #00FFFF (cyan) = transparent
-                                for (int dc = 0; dc < sc; dc++) {
-                                    int dst_x = cur_x + src_c * sc + dc - panel_origin;
-                                    if ((unsigned)dst_x < (unsigned)LCD_H_RES)
-                                        dst_row[dst_x] = px;
-                                }
+            // Seek to current frame and read it
+            long frame_byte_ofs = data_ofs + (long)(*fi) * anim_w * anim_h * 2;
+            if (fseek(af, frame_byte_ofs, SEEK_SET) != 0 ||
+                fread(frame_buf, 2, (size_t)anim_w * anim_h, af) < (size_t)(anim_w * anim_h)) {
+                io_ok = false; break;
+            }
+            if (!use_idle) *fi = (*fi + 1) % frames; // idle frame is advanced by timer above
+
+            for (int panel_idx = 0; panel_idx < 2; panel_idx++) {
+                uint16_t *bg = (panel_idx == 0) ? bg1 : bg2;
+                esp_lcd_panel_handle_t panel = (panel_idx == 0) ? s_panel1 : s_panel2;
+                int panel_origin = panel_idx * LCD_H_RES;
+
+                memcpy(comp, bg, (size_t)LCD_H_RES * LCD_V_RES * 2);
+
+                for (int src_r = 0; src_r < anim_h; src_r++) {
+                    const uint16_t *src_row = frame_buf + (size_t)src_r * anim_w;
+                    for (int dr = 0; dr < sc; dr++) {
+                        int dst_y = cur_y + src_r * sc + dr;
+                        if ((unsigned)dst_y >= (unsigned)LCD_V_RES) continue;
+                        uint16_t *dst_row = comp + (size_t)dst_y * LCD_H_RES;
+                        for (int src_c = 0; src_c < anim_w; src_c++) {
+                            int read_c = (cur_dir < 0) ? (anim_w - 1 - src_c) : src_c;
+                            uint16_t px = src_row[read_c];
+                            if (px == 0xFF07) continue; // #00FFFF (cyan) = transparent
+                            for (int dc = 0; dc < sc; dc++) {
+                                int dst_x = cur_x + src_c * sc + dc - panel_origin;
+                                if ((unsigned)dst_x < (unsigned)LCD_H_RES)
+                                    dst_row[dst_x] = px;
                             }
                         }
                     }
-
-                    esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, comp);
                 }
 
-                int64_t elapsed_us   = esp_timer_get_time() - t0;
-                int64_t remaining_ms = (frame_us - elapsed_us) / 1000;
-                TickType_t ticks = (remaining_ms > 0) ? pdMS_TO_TICKS((uint32_t)remaining_ms) : 0;
-                vTaskDelay(ticks > 0 ? ticks : 1);
+                esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, comp);
             }
+
+            int64_t elapsed_us   = esp_timer_get_time() - t0;
+            int64_t remaining_ms = (fus - elapsed_us) / 1000;
+            TickType_t ticks = (remaining_ms > 0) ? pdMS_TO_TICKS((uint32_t)remaining_ms) : 0;
+            vTaskDelay(ticks > 0 ? ticks : 1);
         }
 
         free(frame_buf);
         free(comp);
-        fclose(af);
+anim_done:
+        fclose(walk_f);
+        fclose(fly_f);
+        fclose(idle_f);
     } while (0);
 
     free(bg1);
