@@ -17,8 +17,14 @@
 #include "esp_spiffs.h"
 #include "neon_letter_service.h"
 #include "display_sequence.h"
-#include "config_menu.h"
-#include "freertos/queue.h"
+
+static const char *TAG = "main";
+
+static const char *s_led_mode_names[] = {
+    [LED_MODE_ALL_PATTERNS] = "ALL_PATTERNS",
+    [LED_MODE_ON]           = "ON",
+    [LED_MODE_OFF]          = "OFF",
+};
 
 // -------------------- Display config --------------------
 // ESP32-S3 N16R8: two independent SPI buses, one per screen
@@ -72,11 +78,6 @@ static const struct { int pin; const char *name; } s_5way_buttons[] = {
 };
 #define NUM_5WAY_BUTTONS (sizeof(s_5way_buttons) / sizeof(s_5way_buttons[0]))
 
-// Map button index to btn_event_t (order matches s_5way_buttons)
-static const btn_event_t s_btn_events[] = {
-    BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_CENTER
-};
-
 static void five_way_switch_task(void *arg)
 {
     bool prev[NUM_5WAY_BUTTONS];
@@ -88,12 +89,15 @@ static void five_way_switch_task(void *arg)
         for (int i = 0; i < (int)NUM_5WAY_BUTTONS; i++) {
             bool cur = gpio_get_level(s_5way_buttons[i].pin);
             if (!cur && prev[i]) { // falling edge = press (active-low)
-                btn_event_t evt = s_btn_events[i];
-                if (evt == BTN_CENTER) {
-                    // Interrupt the running display scene immediately
-                    display_sequence_request_abort();
+                ESP_LOGI(TAG, "Button pressed: %s", s_5way_buttons[i].name);
+                switch (s_5way_buttons[i].pin) {
+                    case PIN_5WAY_CENTER:
+                        current_led_mode = (current_led_mode + 1) % LED_MODE_COUNT;
+                        ESP_LOGI(TAG, "LED mode -> %s", s_led_mode_names[current_led_mode]);
+                        break;
+                    default:
+                        break;
                 }
-                xQueueSend(config_menu_get_queue(), &evt, 0);
             }
             prev[i] = cur;
         }
@@ -287,20 +291,8 @@ void app_main(void)
     // Initialise LCD panels
     lcd_init();
 
-    // Initialise config menu (uses screen 2)
-    config_menu_init(s_panel2);
-
     // Run the display sequence (loops forever)
     while (1) {
-        // Let the menu handle any pending button events
-        config_menu_tick();
-
-        // Pause the display sequence while the menu is open
-        if (config_menu_is_open()) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-
         display_sequence_run(s_panel1, s_panel2,
                              s_display_sequence,
                              sizeof(s_display_sequence) / sizeof(s_display_sequence[0]));

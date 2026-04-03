@@ -3,7 +3,8 @@
 enum led_mode_t {
     LED_MODE_ALL_PATTERNS,
     LED_MODE_ON,
-    LED_MODE_OFF
+    LED_MODE_OFF,
+    LED_MODE_COUNT
 };
 
 extern enum led_mode_t current_led_mode;

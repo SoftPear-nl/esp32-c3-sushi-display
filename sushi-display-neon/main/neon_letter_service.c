@@ -224,15 +224,19 @@ static void led_blink_task(void *arg)
                 break;
             case LED_MODE_ALL_PATTERNS:
             default:
-                led_alternate();
-                led_wave();
-                led_full_flicker();
-                led_chase();
-                led_bounce();
-                led_sparkle();
-                led_heartbeat();
-                led_marquee();
-                led_random_walk();
+#define RUN_PATTERN(fn) do { fn(); if (current_led_mode != LED_MODE_ALL_PATTERNS) goto mode_changed; } while (0)
+                RUN_PATTERN(led_alternate);
+                RUN_PATTERN(led_wave);
+                RUN_PATTERN(led_full_flicker);
+                RUN_PATTERN(led_chase);
+                RUN_PATTERN(led_bounce);
+                RUN_PATTERN(led_sparkle);
+                RUN_PATTERN(led_heartbeat);
+                RUN_PATTERN(led_marquee);
+                RUN_PATTERN(led_random_walk);
+#undef RUN_PATTERN
+                break;
+            mode_changed:
                 break;
         }
     }
