@@ -15,8 +15,14 @@
 #include "esp_timer.h"
 
 #include "esp_spiffs.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
 #include "neon_letter_service.h"
 #include "display_sequence.h"
+#include "font.h"
 
 static const char *TAG = "main";
 
@@ -215,8 +221,10 @@ static void lcd_init(void)
         .sclk_io_num     = PIN_NUM_SCLK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        // Allow full-screen DMA in one shot (240×320×2 bytes)
-        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
+        // Split into 16-row chunks so each DMA bounce buffer is ~7.5 KB instead
+        // of 150 KB.  WiFi's static BSS consumes DMA-capable SRAM and a 150 KB
+        // contiguous allocation fails once WiFi is linked in; 7.5 KB never does.
+        .max_transfer_sz = LCD_H_RES * 16 * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus1, SPI_DMA_CH_AUTO));
 
@@ -227,7 +235,7 @@ static void lcd_init(void)
         .sclk_io_num     = PIN_NUM_SCLK2,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
+        .max_transfer_sz = LCD_H_RES * 16 * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST2, &bus2, SPI_DMA_CH_AUTO));
 
@@ -240,11 +248,11 @@ static void lcd_init(void)
         .lcd_cmd_bits      = 8,
         .lcd_param_bits    = 8,
         .spi_mode          = 0,
-        .trans_queue_depth = 10,
+        .trans_queue_depth = 4,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg1, &io1));
 
-    // ── Panel IO 2 ────────────────────────────────────────────────────────────
+    // ── Panel IO 2 ────────────────────────────────────────────────────────────────
     esp_lcd_panel_io_handle_t io2 = NULL;
     esp_lcd_panel_io_spi_config_t io_cfg2 = {
         .dc_gpio_num       = PIN_NUM_DC2,
@@ -253,7 +261,7 @@ static void lcd_init(void)
         .lcd_cmd_bits      = 8,
         .lcd_param_bits    = 8,
         .spi_mode          = 0,
-        .trans_queue_depth = 10,
+        .trans_queue_depth = 4,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST2, &io_cfg2, &io2));
 
@@ -297,6 +305,94 @@ static void lcd_init(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel1, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel2, true));
+}
+
+// -------------------- WiFi AP + HTTP server --------------------
+#define WIFI_AP_SSID     "SushiDisplay"
+#define WIFI_AP_PASSWORD "SushiDisplay1!"  // min 8 chars; change before deployment
+#define WIFI_AP_CHANNEL  1
+#define WIFI_AP_MAX_CONN 4
+
+static esp_netif_t     *s_ap_netif = NULL;
+static httpd_handle_t   s_httpd    = NULL;
+static bool             s_wifi_prereqs_done = false;
+
+static esp_err_t hello_get_handler(httpd_req_t *req)
+{
+    static const char html[] =
+        "<!DOCTYPE html>"
+        "<html><head><meta charset=\"utf-8\"><title>Sushi Display</title></head>"
+        "<body style=\"font-family:sans-serif;text-align:center;padding:2em\">"
+        "<h1>Hello World!</h1>"
+        "<p>Sushi Display is running.</p>"
+        "</body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static void wifi_http_start(void)
+{
+    // Initialise the one-time WiFi prerequisites lazily so they don't consume
+    // DMA-capable internal SRAM during DISPLAY_MODE_NORMAL.
+    if (!s_wifi_prereqs_done) {
+        esp_err_t nvs_err = nvs_flash_init();
+        if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            nvs_err = nvs_flash_init();
+        }
+        ESP_ERROR_CHECK(nvs_err);
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        s_wifi_prereqs_done = true;
+    }
+
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t ap_cfg = {};
+    memcpy(ap_cfg.ap.ssid,     WIFI_AP_SSID,     strlen(WIFI_AP_SSID));
+    memcpy(ap_cfg.ap.password, WIFI_AP_PASSWORD, strlen(WIFI_AP_PASSWORD));
+    ap_cfg.ap.ssid_len       = (uint8_t)strlen(WIFI_AP_SSID);
+    ap_cfg.ap.channel        = WIFI_AP_CHANNEL;
+    ap_cfg.ap.max_connection = WIFI_AP_MAX_CONN;
+    ap_cfg.ap.authmode       = WIFI_AUTH_WPA2_WPA3_PSK;  // transition: WPA2 + WPA3 SAE
+    ap_cfg.ap.sae_pwe_h2e    = WPA3_SAE_PWE_BOTH;        // support both H2E and hunt-and-peck
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi AP started: SSID=%s  ->  http://192.168.4.1/", WIFI_AP_SSID);
+
+    httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
+    if (httpd_start(&s_httpd, &hcfg) == ESP_OK) {
+        static const httpd_uri_t root = {
+            .uri     = "/",
+            .method  = HTTP_GET,
+            .handler = hello_get_handler,
+        };
+        httpd_register_uri_handler(s_httpd, &root);
+        ESP_LOGI(TAG, "HTTP server started");
+    } else {
+        ESP_LOGE(TAG, "HTTP server failed to start");
+    }
+}
+
+static void wifi_http_stop(void)
+{
+    if (s_httpd) {
+        httpd_stop(s_httpd);
+        s_httpd = NULL;
+    }
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    if (s_ap_netif) {
+        esp_netif_destroy(s_ap_netif);
+        s_ap_netif = NULL;
+    }
+    ESP_LOGI(TAG, "WiFi AP stopped");
 }
 
 // -------------------- Display mode: kirb_back.bmp + kirb_walk.bin overlay --------------------
@@ -372,9 +468,28 @@ static void display_white_screens(void)
         return;
     }
 
-    // Draw background once
+    // ── Overlay WiFi info into the background buffers before first draw ────────
+    {
+        uint16_t fg     = font_color(  0,  40, 120);  // dark navy — readable on light blue
+        uint16_t fg_val = font_color(180,   0,   0);  // deep red for values
+        uint16_t bk     = FONT_TRANSPARENT;
+        // Screen 1: SSID and password
+        font_draw_string(bg1, LCD_H_RES, LCD_V_RES,  4,  4, "WIFI:",           fg,     bk, 2);
+        font_draw_string(bg1, LCD_H_RES, LCD_V_RES,  4, 24, WIFI_AP_SSID,      fg_val, bk, 2);
+        font_draw_string(bg1, LCD_H_RES, LCD_V_RES,  4, 52, "PASS:",           fg,     bk, 2);
+        font_draw_string(bg1, LCD_H_RES, LCD_V_RES,  4, 72, WIFI_AP_PASSWORD,  fg_val, bk, 2);
+        // Screen 2: URL
+        font_draw_string(bg2, LCD_H_RES, LCD_V_RES,  4,  4, "URL:",            fg,     bk, 2);
+        font_draw_string(bg2, LCD_H_RES, LCD_V_RES,  4, 24, "192.168.4.1",     fg_val, bk, 2);
+    }
+
+    // Draw background once before WiFi starts (while DMA-capable heap is intact)
     esp_lcd_panel_draw_bitmap(s_panel1, 0, 0, LCD_H_RES, LCD_V_RES, bg1);
     esp_lcd_panel_draw_bitmap(s_panel2, 0, 0, LCD_H_RES, LCD_V_RES, bg2);
+
+    // Start WiFi AP + HTTP server AFTER the initial background draw so the one-time
+    // PSRAM→DMA bounce buffer allocation happens while DMA heap is still plentiful.
+    wifi_http_start();
 
     // ── Animate kirb_walk.bin / kirby_idle.bin / kirb_fly.bin on top of background ──
     // kirb_fly.bin  : y <= 210
@@ -417,11 +532,14 @@ static void display_white_screens(void)
         if (idle_px > max_px) max_px = idle_px;
         uint16_t *frame_buf = heap_caps_malloc(max_px * 2,
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        uint16_t *comp      = heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * 2,
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!frame_buf || !comp) {
-            ESP_LOGE(TAG, "anim: OOM");
-            free(frame_buf); free(comp);
+        // comp1/comp2 in PSRAM: max_transfer_sz=16-row chunks means bounce buffers
+        // are only ~7.5 KB each, well within DMA SRAM even with WiFi running.
+        size_t screen_px = (size_t)LCD_H_RES * LCD_V_RES;
+        uint16_t *comp1 = heap_caps_malloc(screen_px * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uint16_t *comp2 = heap_caps_malloc(screen_px * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!frame_buf || !comp1 || !comp2) {
+            ESP_LOGE(TAG, "anim: OOM (frame_buf=%p comp1=%p comp2=%p)", frame_buf, comp1, comp2);
+            free(frame_buf); free(comp1); free(comp2);
             goto anim_done;
         }
 
@@ -498,7 +616,8 @@ static void display_white_screens(void)
             if (!use_idle) *fi = (*fi + 1) % frames; // idle frame is advanced by timer above
 
             for (int panel_idx = 0; panel_idx < 2; panel_idx++) {
-                uint16_t *bg = (panel_idx == 0) ? bg1 : bg2;
+                uint16_t *bg   = (panel_idx == 0) ? bg1   : bg2;
+                uint16_t *comp = (panel_idx == 0) ? comp1 : comp2;
                 esp_lcd_panel_handle_t panel = (panel_idx == 0) ? s_panel1 : s_panel2;
                 int panel_origin = panel_idx * LCD_H_RES;
 
@@ -533,7 +652,8 @@ static void display_white_screens(void)
         }
 
         free(frame_buf);
-        free(comp);
+        free(comp1);
+        free(comp2);
 anim_done:
         fclose(walk_f);
         fclose(fly_f);
@@ -545,6 +665,7 @@ anim_done:
     // Guard: idle if we exited the animation early (e.g. file error)
     while (s_display_mode == DISPLAY_MODE_WIFI)
         vTaskDelay(pdMS_TO_TICKS(100));
+    wifi_http_stop();
 }
 
 // -------------------- Display sequence --------------------
