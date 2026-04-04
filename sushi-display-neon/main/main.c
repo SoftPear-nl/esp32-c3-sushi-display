@@ -91,9 +91,9 @@ static const char *s_display_mode_names[] = {
 // NOTE: GPIO 26-32 = internal flash; GPIO 33-40 = OctalSPI PSRAM (N16R8).
 //       Use only GPIOs outside those ranges for user I/O.
 #define PIN_5WAY_UP         1
-#define PIN_5WAY_DOWN      47
+#define PIN_5WAY_DOWN      21
 #define PIN_5WAY_LEFT      2
-#define PIN_5WAY_RIGHT     21
+#define PIN_5WAY_RIGHT     47
 #define PIN_5WAY_CENTER    48
 
 // -------------------- 5-way switch --------------------
