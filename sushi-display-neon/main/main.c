@@ -68,18 +68,18 @@ static const char *s_display_mode_names[] = {
 #define PANEL_COLOR_ORDER_RGB  1
 
 // Screen 1 — SPI2
-#define PIN_NUM_MOSI           11
-#define PIN_NUM_SCLK           12
-#define PIN_NUM_CS             10
-#define PIN_NUM_DC             13
-#define PIN_NUM_RST            14
+#define PIN_NUM_MOSI2           41
+#define PIN_NUM_SCLK2           14
+#define PIN_NUM_CS2             42
+#define PIN_NUM_DC2             13
+#define PIN_NUM_RST2            11
 
 // Screen 2 — SPI3 (independent bus: runs in parallel with SPI2)
-#define PIN_NUM_MOSI2          5
-#define PIN_NUM_SCLK2          6
-#define PIN_NUM_CS2            7
-#define PIN_NUM_DC2            8
-#define PIN_NUM_RST2           9
+#define PIN_NUM_MOSI          9
+#define PIN_NUM_SCLK          6
+#define PIN_NUM_CS            7
+#define PIN_NUM_DC            8
+#define PIN_NUM_RST           5
 
 #define PIN_LETTER_S1       15
 #define PIN_LETTER_U        16
@@ -90,9 +90,9 @@ static const char *s_display_mode_names[] = {
 // -------------------- 5-way switch --------------------
 // NOTE: GPIO 26-32 = internal flash; GPIO 33-40 = OctalSPI PSRAM (N16R8).
 //       Use only GPIOs outside those ranges for user I/O.
-#define PIN_5WAY_UP         2
-#define PIN_5WAY_DOWN       1
-#define PIN_5WAY_LEFT      47
+#define PIN_5WAY_UP         1
+#define PIN_5WAY_DOWN      47
+#define PIN_5WAY_LEFT      2
 #define PIN_5WAY_RIGHT     21
 #define PIN_5WAY_CENTER    48
 
