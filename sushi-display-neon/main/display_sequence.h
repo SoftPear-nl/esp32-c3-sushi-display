@@ -59,6 +59,7 @@ typedef struct {
     int           bounce_dy;      ///< Vertical   velocity (px/step, sign sets start direction)
     uint32_t      bounce_step_ms; ///< Delay between bounce steps (ms); ~16 = 60 fps
     uint32_t      bounce_dur_ms;  ///< Total duration of the bounce scene (ms)
+    uint16_t      bounce_bg_color;///< Background fill colour (big-endian RGB565); 0 = black
 
     // ---- SCENE_ANIM_DUAL ----
     uint32_t           first_frame_ms; ///< Hold first frame for this long before playing

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sushi Display — Sequence Editor</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:sans-serif;background:#e8f4f8;color:#1a1a2e;padding:1em;max-width:760px;margin:0 auto}
+    h1{margin-bottom:.4em;font-size:1.5em}
+    .nav{margin-bottom:.9em;font-size:.88em}
+    .nav a{color:#3a7bd5;text-decoration:none}
+    .nav a:hover{text-decoration:underline}
+    .card{background:#fff;border-radius:8px;padding:.9em 1em;box-shadow:0 1px 4px rgba(0,0,0,.12);margin-bottom:.75em}
+    .scene-card{border-left:4px solid #3a7bd5}
+    .card-head{display:flex;align-items:center;gap:.4em;margin-bottom:.65em}
+    .scene-num{font-weight:700;font-size:.92em;color:#334;flex:1}
+    select,input[type=text],input[type=number]{padding:.25em .4em;border:1px solid #ccd;border-radius:4px;font-size:.86em;background:#f9f9ff}
+    .type-sel{font-size:.84em}
+    .field-select,.field-input{width:100%}
+    button{padding:.24em .56em;border:none;border-radius:4px;cursor:pointer;font-size:.8em;font-weight:600;transition:background .15s}
+    .btn-mv{background:#eef;color:#445}.btn-mv:hover{background:#dde}
+    .btn-mv:disabled{opacity:.35;cursor:default}
+    .btn-del{background:#d03050;color:#fff}.btn-del:hover{background:#b02040}
+    .btn-add{background:#28a745;color:#fff;padding:.38em 1em;font-size:.9em}.btn-add:hover{background:#218838}
+    .btn-save{background:#3a7bd5;color:#fff;padding:.38em 1.1em;font-size:.9em;margin-left:.4em}.btn-save:hover{background:#2f6abf}
+    .btn-reload{background:#6c757d;color:#fff;padding:.38em .9em;font-size:.9em;margin-left:.4em}.btn-reload:hover{background:#5a6268}
+    .field{margin-bottom:.45em;font-size:.87em}
+    .field label{display:block;font-size:.82em;color:#556;margin-bottom:.1em}
+    .field-row{display:flex;gap:.6em}
+    .field-row .field{flex:1;min-width:0}
+    .chkwrap{display:flex;align-items:center;justify-content:flex-end;padding-bottom:.1em}
+    .chkwrap label{display:flex;align-items:center;gap:.35em;font-size:.85em;cursor:pointer;color:#445}
+    .section{margin-top:.55em;padding-top:.45em;border-top:1px dashed #dde}
+    .toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:.4em}
+    #status{min-height:1.3em;font-size:.84em;padding:.25em 0;color:#334}
+    .ok{color:#218838;font-weight:600}
+    .err{color:#c70030;font-weight:600}
+    .empty-msg{color:#99a;font-style:italic;text-align:center;padding:1.8em}
+  </style>
+</head>
+<body>
+  <h1>🍣 Sequence Editor</h1>
+  <div class="nav"><a href="/">← File Manager</a> · <a href="/convert">Image Converter</a></div>
+
+  <datalist id="fl"></datalist>
+  <div id="sc-list"></div>
+
+  <div class="card">
+    <div class="toolbar">
+      <button class="btn-add" onclick="addScene()">+ Add Scene</button>
+      <button class="btn-save" onclick="saveSeq()">💾 Save &amp; Apply</button>
+      <button class="btn-reload" onclick="loadAll()">↺ Reload</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <script>
+    let scenes = [];
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/"/g, '&#34;');
+    }
+
+    const TYPES  = ['STATIC', 'PAN', 'BOUNCE', 'ANIM_DUAL'];
+    const DIRS   = ['LEFT', 'RIGHT', 'UP', 'DOWN'];
+    const DMODES = ['SAME', 'SPLIT_H'];
+    const COLORS = { STATIC: '#3a7bd5', PAN: '#28a745', BOUNCE: '#fd7e14', ANIM_DUAL: '#9b59b6' };
+
+    function dflt() {
+      return {
+        type: 'STATIC', file_path: '/spiffs/', screen: 1, duration_ms: 3000,
+        pan_dir: 'LEFT', pan_step_ms: 80,
+        bounce_dx: 3, bounce_dy: 2, bounce_step_ms: 16, bounce_dur_ms: 5000, bounce_bg_color: '000000',
+        first_frame_ms: 0, last_frame_ms: 0, dual_mode: 'SPLIT_H', scale: 1,
+        parallel: false
+      };
+    }
+
+    function opts(arr, cur) {
+      return arr.map(v =>
+        `<option value="${esc(v)}"${String(v) === String(cur) ? ' selected' : ''}>${esc(v)}</option>`
+      ).join('');
+    }
+
+    function cardHTML(sc, i) {
+      const t = sc.type || 'STATIC';
+      const n = scenes.length;
+      const c = COLORS[t] || '#3a7bd5';
+      const dual = t === 'ANIM_DUAL';
+      return `
+<div class="card scene-card" id="c${i}" style="border-left-color:${c}">
+  <div class="card-head">
+    <span class="scene-num">Scene ${i + 1}</span>
+    <select class="type-sel" onchange="chType(${i},this.value)">${opts(TYPES, t)}</select>
+    <button class="btn-mv" onclick="mv(${i},-1)"${i === 0 ? ' disabled' : ''}>▲</button>
+    <button class="btn-mv" onclick="mv(${i},1)"${i === n - 1 ? ' disabled' : ''}>▼</button>
+    <button class="btn-del" onclick="rm(${i})">✕</button>
+  </div>
+  <div class="field">
+    <label>File path</label>
+    <input class="field-input" type="text" list="fl" value="${esc(sc.file_path || '')}"
+           oninput="set(${i},'file_path',this.value)" placeholder="/spiffs/image.bmp">
+  </div>
+  ${!dual ? `
+  <div class="field-row">
+    <div class="field">
+      <label>Screen</label>
+      <select class="field-select" onchange="set(${i},'screen',+this.value)">${opts([1, 2], sc.screen)}</select>
+    </div>
+    <div class="field chkwrap">
+      <label>
+        <input type="checkbox"${sc.parallel ? ' checked' : ''} onchange="set(${i},'parallel',this.checked)">
+        Parallel with next scene
+      </label>
+    </div>
+  </div>` : ''}
+  ${t === 'STATIC' ? `
+  <div class="section">
+    <div class="field">
+      <label>Duration (ms)</label>
+      <input class="field-input" type="number" min="0" value="${sc.duration_ms}"
+             oninput="set(${i},'duration_ms',+this.value)">
+    </div>
+  </div>` : ''}
+  ${t === 'PAN' ? `
+  <div class="section">
+    <div class="field-row">
+      <div class="field">
+        <label>Pan direction</label>
+        <select class="field-select" onchange="set(${i},'pan_dir',this.value)">${opts(DIRS, sc.pan_dir)}</select>
+      </div>
+      <div class="field">
+        <label>Step delay (ms) — lower = faster</label>
+        <input class="field-input" type="number" min="1" value="${sc.pan_step_ms}"
+               oninput="set(${i},'pan_step_ms',+this.value)">
+      </div>
+    </div>
+  </div>` : ''}
+  ${t === 'BOUNCE' ? `
+  <div class="section">
+    <div class="field-row">
+      <div class="field">
+        <label>dx (px/step)</label>
+        <input class="field-input" type="number" value="${sc.bounce_dx}"
+               oninput="set(${i},'bounce_dx',+this.value)">
+      </div>
+      <div class="field">
+        <label>dy (px/step)</label>
+        <input class="field-input" type="number" value="${sc.bounce_dy}"
+               oninput="set(${i},'bounce_dy',+this.value)">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Step delay (ms) — ~16 = 60 fps</label>
+        <input class="field-input" type="number" min="1" value="${sc.bounce_step_ms}"
+               oninput="set(${i},'bounce_step_ms',+this.value)">
+      </div>
+      <div class="field">
+        <label>Duration (ms)</label>
+        <input class="field-input" type="number" min="0" value="${sc.bounce_dur_ms}"
+               oninput="set(${i},'bounce_dur_ms',+this.value)">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Background color</label>
+        <div style="display:flex;align-items:center;gap:.4em">
+          <input type="color" id="bgc${i}" value="#${sc.bounce_bg_color || '000000'}"
+                 oninput="setBgColor(${i},this.value)" style="height:2em;width:3em;padding:0;border:1px solid #ccd;border-radius:4px;cursor:pointer">
+          <span id="bgct${i}" style="font-size:.82em;color:#556">#${sc.bounce_bg_color || '000000'}</span>
+        </div>
+      </div>
+    </div>
+  </div>` : ''}
+  ${dual ? `
+  <div class="section">
+    <div class="field-row">
+      <div class="field">
+        <label>First frame hold (ms)</label>
+        <input class="field-input" type="number" min="0" value="${sc.first_frame_ms}"
+               oninput="set(${i},'first_frame_ms',+this.value)">
+      </div>
+      <div class="field">
+        <label>Last frame hold (ms)</label>
+        <input class="field-input" type="number" min="0" value="${sc.last_frame_ms}"
+               oninput="set(${i},'last_frame_ms',+this.value)">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Dual mode</label>
+        <select class="field-select" onchange="set(${i},'dual_mode',this.value)">${opts(DMODES, sc.dual_mode)}</select>
+      </div>
+      <div class="field">
+        <label>Scale (1 = none, 2 = 2× nearest)</label>
+        <input class="field-input" type="number" min="1" max="4" value="${sc.scale || 1}"
+               oninput="set(${i},'scale',+this.value)">
+      </div>
+    </div>
+  </div>` : ''}
+</div>`;
+    }
+
+    function render() {
+      const el = document.getElementById('sc-list');
+      el.innerHTML = scenes.length
+        ? scenes.map(cardHTML).join('')
+        : '<div class="card empty-msg">No scenes yet — click "+ Add Scene" to create one.</div>';
+    }
+
+    function set(i, k, v) { scenes[i][k] = v; }
+
+    function setBgColor(i, hex) {
+      const col = hex.slice(1).toUpperCase();
+      scenes[i].bounce_bg_color = col;
+      const lbl = document.getElementById('bgct' + i);
+      if (lbl) lbl.textContent = '#' + col;
+    }
+
+    function chType(i, v) {
+      scenes[i].type = v;
+      const el = document.getElementById('c' + i);
+      if (el) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = cardHTML(scenes[i], i);
+        el.replaceWith(tmp.firstChild);
+      }
+    }
+
+    function mv(i, d) {
+      const j = i + d;
+      if (j < 0 || j >= scenes.length) return;
+      [scenes[i], scenes[j]] = [scenes[j], scenes[i]];
+      render();
+    }
+
+    function rm(i) { scenes.splice(i, 1); render(); }
+    function addScene() { scenes.push(dflt()); render(); }
+
+    async function loadAll() {
+      stat('Loading\u2026', '');
+      try {
+        const fd = await fetch('/api/files').then(r => r.json());
+        const dl = document.getElementById('fl');
+        dl.innerHTML = (fd.files || [])
+          .map(f => `<option value="/spiffs/${esc(f.name)}">`)
+          .join('');
+        scenes = await fetch('/api/sequence').then(r => r.json());
+        render();
+        stat('Loaded ' + scenes.length + ' scene(s).', 'ok');
+      } catch (e) {
+        stat('Load error: ' + e.message, 'err');
+      }
+    }
+
+    async function saveSeq() {
+      stat('Saving\u2026', '');
+      try {
+        const r = await fetch('/api/sequence', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(scenes)
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
+        const d = await r.json();
+        if (!d.ok) throw new Error('Server returned error');
+        stat('\u2713 Saved! Display will update after the current scene finishes.', 'ok');
+      } catch (e) {
+        stat('Save failed: ' + e.message, 'err');
+      }
+    }
+
+    function stat(msg, cls) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = cls || '';
+    }
+
+    loadAll();
+  </script>
+</body>
+</html>

@@ -384,14 +384,17 @@ static void scene_bounce(esp_lcd_panel_handle_t panel, const scene_t *s)
     int img_w = info.width  < LCD_W ? info.width  : LCD_W;
     int img_h = info.height < LCD_H ? info.height : LCD_H;
 
-    // Full-screen framebuffer in PSRAM, zero-initialised (black canvas)
-    uint16_t *fb = heap_caps_calloc(LCD_W * LCD_H, 2,
+    uint16_t bg = s->bounce_bg_color;  // big-endian RGB565; 0 = black
+
+    // Full-screen framebuffer in PSRAM, filled with the background colour
+    uint16_t *fb = heap_caps_malloc((size_t)LCD_W * LCD_H * 2,
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!fb) {
         ESP_LOGE(TAG, "bounce: OOM framebuffer");
         free(img_buf);
         return;
     }
+    for (size_t _i = 0; _i < (size_t)LCD_W * LCD_H; _i++) fb[_i] = bg;
 
     int x  = (LCD_W - img_w) / 2;
     int y  = (LCD_H - img_h) / 2;
@@ -405,11 +408,12 @@ static void scene_bounce(esp_lcd_panel_handle_t panel, const scene_t *s)
                    img_buf + (size_t)_r * img_w, \
                    (size_t)img_w * 2)
 
-    // Clear sprite rect in framebuffer at (bx, by)
+    // Clear sprite rect in framebuffer at (bx, by) — fills with bg colour
     #define ERASE(bx, by) \
-        for (int _r = 0; _r < img_h; _r++) \
-            memset(fb + (size_t)((by) + _r) * LCD_W + (bx), 0, \
-                   (size_t)img_w * 2)
+        for (int _r = 0; _r < img_h; _r++) { \
+            uint16_t *_row = fb + (size_t)((by) + _r) * LCD_W + (bx); \
+            for (int _c = 0; _c < img_w; _c++) _row[_c] = bg; \
+        }
 
     BLIT(x, y);
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb);

@@ -22,6 +22,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "cJSON.h"
 #include "neon_letter_service.h"
 #include "display_sequence.h"
 #include "font.h"
@@ -318,6 +319,8 @@ static void lcd_init(void)
 static esp_netif_t     *s_ap_netif = NULL;
 static httpd_handle_t   s_httpd    = NULL;
 static bool             s_wifi_prereqs_done = false;
+static const scene_t   *s_default_seq       = NULL;
+static int              s_default_seq_n     = 0;
 
 static esp_err_t hello_get_handler(httpd_req_t *req)
 {
@@ -524,6 +527,287 @@ static esp_err_t delete_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── Sequence storage & web API ──────────────────────────────────────────────
+
+#define MAX_DYN_SCENES  32
+#define SEQUENCE_PATH   "/spiffs/sequence.json"
+#define SEQ_BODY_MAX    16384
+
+static scene_t  s_dyn_scenes[MAX_DYN_SCENES];
+static char     s_dyn_paths [MAX_DYN_SCENES][64];
+static int      s_dyn_count  = 0;
+static bool     s_use_dyn    = false;
+
+static const char *scene_type_str(scene_type_t t) {
+    switch (t) {
+        case SCENE_PAN:       return "PAN";
+        case SCENE_BOUNCE:    return "BOUNCE";
+        case SCENE_ANIM_DUAL: return "ANIM_DUAL";
+        default:              return "STATIC";
+    }
+}
+static scene_type_t scene_type_from_str(const char *s) {
+    if (!s)                          return SCENE_STATIC;
+    if (strcmp(s, "PAN")       == 0) return SCENE_PAN;
+    if (strcmp(s, "BOUNCE")    == 0) return SCENE_BOUNCE;
+    if (strcmp(s, "ANIM_DUAL") == 0) return SCENE_ANIM_DUAL;
+    return SCENE_STATIC;
+}
+static const char *pan_dir_str(pan_dir_t d) {
+    switch (d) {
+        case DIR_RIGHT: return "RIGHT";
+        case DIR_UP:    return "UP";
+        case DIR_DOWN:  return "DOWN";
+        default:        return "LEFT";
+    }
+}
+static pan_dir_t pan_dir_from_str(const char *s) {
+    if (!s)                      return DIR_LEFT;
+    if (strcmp(s, "RIGHT") == 0) return DIR_RIGHT;
+    if (strcmp(s, "UP")    == 0) return DIR_UP;
+    if (strcmp(s, "DOWN")  == 0) return DIR_DOWN;
+    return DIR_LEFT;
+}
+static const char *dual_mode_str(dual_screen_mode_t m) {
+    return (m == DUAL_SPLIT_H) ? "SPLIT_H" : "SAME";
+}
+static dual_screen_mode_t dual_mode_from_str(const char *s) {
+    return (s && strcmp(s, "SPLIT_H") == 0) ? DUAL_SPLIT_H : DUAL_SAME;
+}
+
+static void parse_seq_item(const cJSON *obj, int idx)
+{
+    scene_t *sc = &s_dyn_scenes[idx];
+    memset(sc, 0, sizeof(*sc));
+    cJSON *v;
+    v = cJSON_GetObjectItem(obj, "type");
+    sc->type = scene_type_from_str(cJSON_IsString(v) ? v->valuestring : NULL);
+    v = cJSON_GetObjectItem(obj, "file_path");
+    if (cJSON_IsString(v) && v->valuestring[0]) {
+        snprintf(s_dyn_paths[idx], sizeof(s_dyn_paths[0]), "%s", v->valuestring);
+        sc->file_path = s_dyn_paths[idx];
+    }
+    v = cJSON_GetObjectItem(obj, "screen");
+    sc->screen = cJSON_IsNumber(v) ? (screen_id_t)((int)v->valuedouble - 1) : SCREEN_1;
+    if ((int)sc->screen < 0 || sc->screen > SCREEN_2) sc->screen = SCREEN_1;
+    v = cJSON_GetObjectItem(obj, "duration_ms");
+    sc->duration_ms = cJSON_IsNumber(v) ? (uint32_t)v->valuedouble : 0;
+    v = cJSON_GetObjectItem(obj, "pan_dir");
+    sc->pan_dir = pan_dir_from_str(cJSON_IsString(v) ? v->valuestring : NULL);
+    v = cJSON_GetObjectItem(obj, "pan_step_ms");
+    sc->pan_step_ms = cJSON_IsNumber(v) ? (uint32_t)v->valuedouble : 80;
+    v = cJSON_GetObjectItem(obj, "bounce_dx");
+    sc->bounce_dx = cJSON_IsNumber(v) ? (int)v->valuedouble : 3;
+    v = cJSON_GetObjectItem(obj, "bounce_dy");
+    sc->bounce_dy = cJSON_IsNumber(v) ? (int)v->valuedouble : 2;
+    v = cJSON_GetObjectItem(obj, "bounce_step_ms");
+    sc->bounce_step_ms = cJSON_IsNumber(v) ? (uint32_t)v->valuedouble : 16;
+    v = cJSON_GetObjectItem(obj, "bounce_dur_ms");
+    sc->bounce_dur_ms = cJSON_IsNumber(v) ? (uint32_t)v->valuedouble : 5000;
+    v = cJSON_GetObjectItem(obj, "bounce_bg_color");
+    if (cJSON_IsString(v) && v->valuestring) {
+        // Stored as "RRGGBB" hex; convert to big-endian RGB565
+        unsigned r, g, b;
+        if (sscanf(v->valuestring, "%02x%02x%02x", &r, &g, &b) == 3) {
+            uint16_t le = (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
+            sc->bounce_bg_color = (uint16_t)((le >> 8) | (le << 8)); // LE -> BE
+        }
+    } else {
+        sc->bounce_bg_color = 0;
+    }
+    v = cJSON_GetObjectItem(obj, "first_frame_ms");
+    sc->first_frame_ms = cJSON_IsNumber(v) ? (uint32_t)v->valuedouble : 0;
+    v = cJSON_GetObjectItem(obj, "last_frame_ms");
+    sc->last_frame_ms = cJSON_IsNumber(v) ? (uint32_t)v->valuedouble : 0;
+    v = cJSON_GetObjectItem(obj, "dual_mode");
+    sc->dual_mode = dual_mode_from_str(cJSON_IsString(v) ? v->valuestring : NULL);
+    v = cJSON_GetObjectItem(obj, "scale");
+    sc->scale = cJSON_IsNumber(v) ? (int)v->valuedouble : 1;
+    v = cJSON_GetObjectItem(obj, "parallel");
+    sc->parallel = cJSON_IsBool(v) && cJSON_IsTrue(v);
+}
+
+static void sequence_load(void)
+{
+    FILE *f = fopen(SEQUENCE_PATH, "r");
+    if (!f) { ESP_LOGI(TAG, "No sequence.json, using compiled-in defaults"); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > SEQ_BODY_MAX) { fclose(f); return; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return; }
+    fread(buf, 1, (size_t)sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+    cJSON *arr = cJSON_Parse(buf);
+    free(buf);
+    if (!arr || !cJSON_IsArray(arr)) { cJSON_Delete(arr); return; }
+    int count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, arr) {
+        if (count >= MAX_DYN_SCENES || !cJSON_IsObject(item)) break;
+        parse_seq_item(item, count++);
+    }
+    cJSON_Delete(arr);
+    s_dyn_count = count;
+    s_use_dyn   = (count > 0);
+    ESP_LOGI(TAG, "Loaded %d scene(s) from " SEQUENCE_PATH, count);
+}
+
+// GET /api/sequence — current sequence as JSON
+static esp_err_t api_sequence_get_handler(httpd_req_t *req)
+{
+    int count          = s_use_dyn ? s_dyn_count : s_default_seq_n;
+    const scene_t *seq = s_use_dyn ? s_dyn_scenes : s_default_seq;
+    if (!seq) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "not ready");
+        return ESP_FAIL;
+    }
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < count; i++) {
+        const scene_t *sc = &seq[i];
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(obj, "type",           scene_type_str(sc->type));
+        cJSON_AddStringToObject(obj, "file_path",      sc->file_path ? sc->file_path : "");
+        cJSON_AddNumberToObject(obj, "screen",         sc->screen + 1);
+        cJSON_AddNumberToObject(obj, "duration_ms",    sc->duration_ms);
+        cJSON_AddStringToObject(obj, "pan_dir",        pan_dir_str(sc->pan_dir));
+        cJSON_AddNumberToObject(obj, "pan_step_ms",    sc->pan_step_ms);
+        cJSON_AddNumberToObject(obj, "bounce_dx",      sc->bounce_dx);
+        cJSON_AddNumberToObject(obj, "bounce_dy",      sc->bounce_dy);
+        cJSON_AddNumberToObject(obj, "bounce_step_ms", sc->bounce_step_ms);
+        cJSON_AddNumberToObject(obj, "bounce_dur_ms",  sc->bounce_dur_ms);
+        {
+            // Convert big-endian RGB565 -> "RRGGBB" hex string
+            uint16_t be = sc->bounce_bg_color;
+            uint16_t le = (uint16_t)((be >> 8) | (be << 8));
+            unsigned r = (unsigned)(le >> 11) << 3;
+            unsigned g = (unsigned)((le >> 5) & 0x3F) << 2;
+            unsigned b = (unsigned)(le & 0x1F) << 3;
+            char hex[8];
+            snprintf(hex, sizeof(hex), "%02X%02X%02X", r, g, b);
+            cJSON_AddStringToObject(obj, "bounce_bg_color", hex);
+        }
+        cJSON_AddNumberToObject(obj, "first_frame_ms", sc->first_frame_ms);
+        cJSON_AddNumberToObject(obj, "last_frame_ms",  sc->last_frame_ms);
+        cJSON_AddStringToObject(obj, "dual_mode",      dual_mode_str(sc->dual_mode));
+        cJSON_AddNumberToObject(obj, "scale",          sc->scale);
+        cJSON_AddBoolToObject(obj,   "parallel",       sc->parallel);
+        cJSON_AddItemToArray(arr, obj);
+    }
+    char *s = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    if (!s) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cJSON error");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, s);
+    free(s);
+    return ESP_OK;
+}
+
+// POST /api/sequence — save and hot-reload sequence
+static esp_err_t api_sequence_post_handler(httpd_req_t *req)
+{
+    if (req->content_len == 0 || req->content_len > SEQ_BODY_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad content length");
+        return ESP_FAIL;
+    }
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int rcvd = httpd_req_recv(req, buf, req->content_len);
+    if (rcvd <= 0) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv error");
+        return ESP_FAIL;
+    }
+    buf[rcvd] = '\0';
+    cJSON *arr = cJSON_Parse(buf);
+    if (!arr || !cJSON_IsArray(arr)) {
+        free(buf); cJSON_Delete(arr);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON array");
+        return ESP_FAIL;
+    }
+    if (cJSON_GetArraySize(arr) > MAX_DYN_SCENES) {
+        free(buf); cJSON_Delete(arr);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "too many scenes (max 32)");
+        return ESP_FAIL;
+    }
+    FILE *f = fopen(SEQUENCE_PATH, "w");
+    if (!f) {
+        free(buf); cJSON_Delete(arr);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cannot write file");
+        return ESP_FAIL;
+    }
+    fwrite(buf, 1, (size_t)rcvd, f);
+    fclose(f);
+    free(buf);
+    int count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, arr) {
+        if (count >= MAX_DYN_SCENES || !cJSON_IsObject(item)) break;
+        parse_seq_item(item, count++);
+    }
+    cJSON_Delete(arr);
+    s_dyn_count = count;
+    s_use_dyn   = (count > 0);
+    display_sequence_request_abort();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// GET /sequences — serve the sequence-editor HTML page from SPIFFS
+static esp_err_t sequences_page_handler(httpd_req_t *req)
+{
+    FILE *f = fopen("/spiffs/sequences.html", "r");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "sequences.html not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "text/html");
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
+            fclose(f);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// GET /convert — serve the image-converter HTML page from SPIFFS
+static esp_err_t convert_page_handler(httpd_req_t *req)
+{
+    FILE *f = fopen("/spiffs/convert.html", "r");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "convert.html not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "text/html");
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
+            fclose(f);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static void wifi_http_start(void)
 {
     // Initialise the one-time WiFi prerequisites lazily so they don't consume
@@ -562,18 +846,26 @@ static void wifi_http_start(void)
     httpd_config_t hcfg    = HTTPD_DEFAULT_CONFIG();
     hcfg.stack_size        = 8192;  // file I/O needs more than the 4 KB default
     hcfg.recv_wait_timeout = 30;    // seconds; needed for large file uploads
-    hcfg.max_uri_handlers  = 8;
+    hcfg.max_uri_handlers  = 12;
     if (httpd_start(&s_httpd, &hcfg) == ESP_OK) {
-        static const httpd_uri_t uri_root     = { .uri="/",          .method=HTTP_GET,  .handler=hello_get_handler  };
-        static const httpd_uri_t uri_files    = { .uri="/api/files", .method=HTTP_GET,  .handler=api_files_handler  };
-        static const httpd_uri_t uri_download = { .uri="/download",  .method=HTTP_GET,  .handler=download_handler   };
-        static const httpd_uri_t uri_upload   = { .uri="/upload",    .method=HTTP_POST, .handler=upload_handler     };
-        static const httpd_uri_t uri_delete   = { .uri="/delete",    .method=HTTP_POST, .handler=delete_handler     };
+        static const httpd_uri_t uri_root     = { .uri="/",             .method=HTTP_GET,  .handler=hello_get_handler         };
+        static const httpd_uri_t uri_files    = { .uri="/api/files",    .method=HTTP_GET,  .handler=api_files_handler         };
+        static const httpd_uri_t uri_download = { .uri="/download",     .method=HTTP_GET,  .handler=download_handler          };
+        static const httpd_uri_t uri_upload   = { .uri="/upload",       .method=HTTP_POST, .handler=upload_handler            };
+        static const httpd_uri_t uri_delete   = { .uri="/delete",       .method=HTTP_POST, .handler=delete_handler            };
+        static const httpd_uri_t uri_seq_get  = { .uri="/api/sequence", .method=HTTP_GET,  .handler=api_sequence_get_handler  };
+        static const httpd_uri_t uri_seq_post = { .uri="/api/sequence", .method=HTTP_POST, .handler=api_sequence_post_handler };
+        static const httpd_uri_t uri_seq_page = { .uri="/sequences",    .method=HTTP_GET,  .handler=sequences_page_handler    };
+        static const httpd_uri_t uri_conv_page= { .uri="/convert",      .method=HTTP_GET,  .handler=convert_page_handler      };
         httpd_register_uri_handler(s_httpd, &uri_root);
         httpd_register_uri_handler(s_httpd, &uri_files);
         httpd_register_uri_handler(s_httpd, &uri_download);
         httpd_register_uri_handler(s_httpd, &uri_upload);
         httpd_register_uri_handler(s_httpd, &uri_delete);
+        httpd_register_uri_handler(s_httpd, &uri_seq_get);
+        httpd_register_uri_handler(s_httpd, &uri_seq_post);
+        httpd_register_uri_handler(s_httpd, &uri_seq_page);
+        httpd_register_uri_handler(s_httpd, &uri_conv_page);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "HTTP server failed to start");
@@ -939,6 +1231,11 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs_conf));
 
+    // Register compiled-in default sequence, then try to load override from SPIFFS
+    s_default_seq   = s_display_sequence;
+    s_default_seq_n = sizeof(s_display_sequence) / sizeof(s_display_sequence[0]);
+    sequence_load();
+
     // Initialise LCD panels
     lcd_init();
 
@@ -950,9 +1247,11 @@ void app_main(void)
                 break;
             case DISPLAY_MODE_NORMAL:
             default:
-                display_sequence_run(s_panel1, s_panel2,
-                                     s_display_sequence,
-                                     sizeof(s_display_sequence) / sizeof(s_display_sequence[0]));
+                if (s_use_dyn) {
+                    display_sequence_run(s_panel1, s_panel2, s_dyn_scenes, s_dyn_count);
+                } else {
+                    display_sequence_run(s_panel1, s_panel2, s_default_seq, s_default_seq_n);
+                }
                 break;
         }
     }

@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sushi Display — Image Converter</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:sans-serif;background:#e8f4f8;color:#1a1a2e;padding:1em;max-width:720px;margin:0 auto}
+    h1{margin-bottom:.4em;font-size:1.5em}
+    .nav{margin-bottom:.9em;font-size:.88em}
+    .nav a{color:#3a7bd5;text-decoration:none}
+    .nav a:hover{text-decoration:underline}
+    .card{background:#fff;border-radius:8px;padding:.9em 1em;box-shadow:0 1px 4px rgba(0,0,0,.12);margin-bottom:.75em}
+    h2{font-size:1.05em;font-weight:600;margin-bottom:.5em;color:#334}
+    #drop-zone{border:2px dashed #aac;border-radius:6px;padding:1.4em;text-align:center;color:#779;cursor:pointer;transition:background .2s}
+    #drop-zone.over{background:#d6eaf8;border-color:#3a7bd5}
+    #file-input{display:none}
+    .row{display:flex;gap:.6em;flex-wrap:wrap;align-items:center;margin-bottom:.4em}
+    .lbl{font-size:.84em;color:#556;white-space:nowrap}
+    select,input[type=text],input[type=number]{padding:.25em .4em;border:1px solid #ccd;border-radius:4px;font-size:.86em;background:#f9f9ff}
+    input[type=range]{width:100%;accent-color:#3a7bd5;padding:0}
+    .preset-row{display:flex;gap:.35em;flex-wrap:wrap;margin-bottom:.5em}
+    .preset{background:#eef;color:#334;border:1px solid #ccd;border-radius:4px;padding:.22em .6em;cursor:pointer;font-size:.83em;font-weight:600;transition:background .15s}
+    .preset.active,.preset:hover{background:#3a7bd5;color:#fff;border-color:#3a7bd5}
+    .seg{display:flex;border:1px solid #ccd;border-radius:4px;overflow:hidden}
+    .seg button{border:none;border-radius:0;background:#f9f9ff;color:#556;padding:.26em .7em;font-size:.84em;font-weight:600;cursor:pointer;transition:background .15s}
+    .seg button.on{background:#3a7bd5;color:#fff}
+    .seg button+button{border-left:1px solid #ccd}
+    .previews{display:flex;gap:1em;align-items:flex-start;flex-wrap:wrap;margin-top:.5em}
+    .prev-wrap{text-align:center;min-width:0}
+    .prev-lbl{font-size:.78em;color:#778;margin-top:.3em}
+    #src-cv{border:1px solid #ccd;border-radius:4px;display:block;touch-action:none;max-width:100%}
+    #src-cv.can-drag{cursor:grab}
+    #src-cv.dragging{cursor:grabbing}
+    #res-cv{border:1px solid #ccd;border-radius:4px;display:block;image-rendering:pixelated;max-width:100%}
+    .btn-p{background:#3a7bd5;color:#fff;border:none;border-radius:4px;padding:.38em 1em;font-size:.88em;font-weight:600;cursor:pointer;transition:background .15s}
+    .btn-p:hover{background:#2f6abf}
+    .btn-p:disabled{opacity:.4;cursor:default}
+    .btn-s{background:#6c757d;color:#fff;border:none;border-radius:4px;padding:.38em 1em;font-size:.88em;font-weight:600;cursor:pointer;transition:background .15s}
+    .btn-s:hover{background:#5a6268}
+    #status{min-height:1.2em;font-size:.84em;padding:.2em 0}
+    .ok{color:#218838;font-weight:600}
+    .err{color:#c70030;font-weight:600}
+    .dim{color:#778}
+  </style>
+</head>
+<body>
+  <h1>🍣 Image Converter</h1>
+  <div class="nav">
+    <a href="/">← File Manager</a> · <a href="/sequences">Sequences</a>
+  </div>
+
+  <div class="card">
+    <div id="drop-zone"
+         onclick="document.getElementById('file-input').click()"
+         ondragover="event.preventDefault();this.classList.add('over')"
+         ondragleave="this.classList.remove('over')"
+         ondrop="onDrop(event)">
+      Tap or drag an image here — converts to 16-bpp BMP for the display
+    </div>
+    <input id="file-input" type="file" accept="image/*" onchange="loadFile(event.target.files[0])">
+    <div id="src-info" style="font-size:.82em;color:#556;margin-top:.3em"></div>
+  </div>
+
+  <div id="cfg-card" class="card" style="display:none">
+    <h2>Target Size</h2>
+    <div class="preset-row">
+      <button class="preset active" data-w="240" data-h="320" onclick="setPreset(this)">Single screen (240×320)</button>
+      <button class="preset" data-w="480" data-h="320" onclick="setPreset(this)">Dual screen (480×320)</button>
+      <button id="preset-custom" class="preset" onclick="setPreset(this)">Custom</button>
+    </div>
+    <div id="custom-row" class="row" style="display:none">
+      <span class="lbl">Width</span>
+      <input type="number" id="tw" value="240" min="1" max="960" style="width:5em" oninput="customSize()">
+      <span class="lbl">Height</span>
+      <input type="number" id="th" value="320" min="1" max="960" style="width:5em" oninput="customSize()">
+    </div>
+
+    <h2 style="margin-top:.75em">Fit Mode</h2>
+    <div class="row" style="gap:.5em">
+      <div class="seg">
+        <button id="m-fit" class="on" onclick="setMode('fit')" title="Scale to fit, add background bars">Fit</button>
+        <button id="m-fill" onclick="setMode('fill')" title="Scale to fill, crop excess">Fill &amp; Crop</button>
+        <button id="m-stretch" onclick="setMode('stretch')" title="Stretch to fill exactly">Stretch</button>
+      </div>
+      <div id="bg-row" style="display:flex;align-items:center;gap:.4em">
+        <span class="lbl">BG</span>
+        <input type="color" id="bg-color" value="#000000" oninput="render()"
+               style="height:1.9em;width:2.5em;padding:1px;border:1px solid #ccd;border-radius:4px;cursor:pointer">
+      </div>
+    </div>
+    <div id="crop-sliders" style="display:none;margin-top:.2em">
+      <div class="row" style="gap:.4em;margin-bottom:.2em">
+        <span class="lbl" style="width:3.5em">Horiz</span>
+        <input type="range" id="cx" min="0" max="100" value="50" oninput="sliderCrop()">
+      </div>
+      <div class="row" style="gap:.4em">
+        <span class="lbl" style="width:3.5em">Vert</span>
+        <input type="range" id="cy" min="0" max="100" value="50" oninput="sliderCrop()">
+      </div>
+      <div style="font-size:.77em;color:#99a;margin-top:.15em">Drag the bright area in the source preview to reposition the crop</div>
+    </div>
+  </div>
+
+  <div id="prev-card" class="card" style="display:none">
+    <h2>Preview</h2>
+    <div class="previews">
+      <div class="prev-wrap">
+        <canvas id="src-cv"></canvas>
+        <div class="prev-lbl" id="src-lbl">Source</div>
+      </div>
+      <div class="prev-wrap">
+        <canvas id="res-cv"></canvas>
+        <div class="prev-lbl" id="res-lbl">Output</div>
+      </div>
+    </div>
+    <div id="size-hint" class="dim" style="font-size:.8em;margin-top:.4em"></div>
+  </div>
+
+  <div id="out-card" class="card" style="display:none">
+    <h2>Export</h2>
+    <div class="row">
+      <span class="lbl">Filename</span>
+      <input type="text" id="fname" value="image.bmp" style="flex:1">
+    </div>
+    <div class="row" style="margin-top:.35em">
+      <button class="btn-p" onclick="doUpload()">⬆ Convert &amp; Upload</button>
+      <button class="btn-s" onclick="doDownload()">↓ Download BMP</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    // ── State ───────────────────────────────────────────────────────────────────
+    let srcImg = null, srcW = 0, srcH = 0;
+    let targetW = 240, targetH = 320;
+    let mode = 'fit';
+    let cropX = 0.5, cropY = 0.5;
+    const PREV_MAX = 280;  // max px for source preview dimension
+
+    // ── File loading ────────────────────────────────────────────────────────────
+    function onDrop(e) {
+      e.preventDefault();
+      document.getElementById('drop-zone').classList.remove('over');
+      const f = e.dataTransfer.files[0];
+      if (f) loadFile(f);
+    }
+
+    function loadFile(file) {
+      if (!file) return;
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        srcImg = img; srcW = img.naturalWidth; srcH = img.naturalHeight;
+        document.getElementById('src-info').textContent =
+          file.name + '  —  ' + srcW + '×' + srcH + ' px  (' + (file.size / 1024).toFixed(0) + ' KB)';
+        const base = file.name.replace(/\.[^.]+$/, '')
+                               .replace(/[^a-zA-Z0-9_-]/g, '_')
+                               .slice(0, 27);
+        document.getElementById('fname').value = base + '.bmp';
+        // Auto-pick best preset based on aspect ratio
+        const ar = srcW / srcH;
+        if (Math.abs(ar - 240/320) < Math.abs(ar - 480/320)) {
+          applyPreset(240, 320);
+        } else {
+          applyPreset(480, 320);
+        }
+        ['cfg-card','prev-card','out-card'].forEach(id =>
+          document.getElementById(id).style.display = '');
+        render();
+      };
+      img.src = url;
+    }
+
+    // ── Size presets ────────────────────────────────────────────────────────────
+    function setPreset(btn) {
+      document.querySelectorAll('.preset').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const isCustom = btn.id === 'preset-custom';
+      document.getElementById('custom-row').style.display = isCustom ? '' : 'none';
+      if (!isCustom) applyPreset(+btn.dataset.w, +btn.dataset.h);
+    }
+
+    function applyPreset(w, h) {
+      targetW = w; targetH = h;
+      document.getElementById('tw').value = w;
+      document.getElementById('th').value = h;
+      if (srcImg) render();
+    }
+
+    function customSize() {
+      targetW = Math.max(1, +document.getElementById('tw').value || 240);
+      targetH = Math.max(1, +document.getElementById('th').value || 320);
+      if (srcImg) render();
+    }
+
+    // ── Fit mode ────────────────────────────────────────────────────────────────
+    function setMode(m) {
+      mode = m;
+      ['fit','fill','stretch'].forEach(k =>
+        document.getElementById('m-' + k).classList.toggle('on', k === m));
+      document.getElementById('bg-row').style.display    = m === 'fit'  ? '' : 'none';
+      document.getElementById('crop-sliders').style.display = m === 'fill' ? '' : 'none';
+      const cv = document.getElementById('src-cv');
+      cv.classList.toggle('can-drag', m === 'fill');
+      if (srcImg) render();
+    }
+
+    function sliderCrop() {
+      cropX = document.getElementById('cx').value / 100;
+      cropY = document.getElementById('cy').value / 100;
+      render();
+    }
+
+    // ── Render ──────────────────────────────────────────────────────────────────
+    function render() {
+      if (!srcImg) return;
+      renderResult();
+      renderSourcePreview();
+      const stride = Math.floor((targetW * 2 + 3) / 4) * 4;
+      document.getElementById('size-hint').textContent =
+        'Output: ' + targetW + '×' + targetH + '  |  BMP ~' + ((66 + stride * targetH) / 1024).toFixed(1) + ' KB';
+      document.getElementById('src-lbl').textContent = 'Source (' + srcW + '×' + srcH + ')';
+      document.getElementById('res-lbl').textContent = 'Output (' + targetW + '×' + targetH + ')';
+    }
+
+    function renderResult() {
+      const rc = document.getElementById('res-cv');
+      rc.width = targetW; rc.height = targetH;
+      const ds = Math.min(1, 220 / targetW, 220 / targetH);
+      rc.style.width  = Math.round(targetW * ds) + 'px';
+      rc.style.height = Math.round(targetH * ds) + 'px';
+      const ctx = rc.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      if (mode === 'fit') {
+        ctx.fillStyle = document.getElementById('bg-color').value;
+        ctx.fillRect(0, 0, targetW, targetH);
+        const sc = Math.min(targetW / srcW, targetH / srcH);
+        ctx.drawImage(srcImg, (targetW - srcW * sc) / 2, (targetH - srcH * sc) / 2, srcW * sc, srcH * sc);
+      } else if (mode === 'fill') {
+        const sc = Math.max(targetW / srcW, targetH / srcH);
+        ctx.drawImage(srcImg,
+          -cropX * (srcW * sc - targetW), -cropY * (srcH * sc - targetH),
+          srcW * sc, srcH * sc);
+      } else {
+        ctx.drawImage(srcImg, 0, 0, targetW, targetH);
+      }
+    }
+
+    function renderSourcePreview() {
+      const cv = document.getElementById('src-cv');
+      const ps = Math.min(1, PREV_MAX / srcW, PREV_MAX / srcH);
+      const pw = Math.round(srcW * ps), ph = Math.round(srcH * ps);
+      cv.width = pw; cv.height = ph;
+      cv.style.width = pw + 'px'; cv.style.height = ph + 'px';
+      const ctx = cv.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+
+      if (mode === 'fill') {
+        const fillSc = Math.max(targetW / srcW, targetH / srcH);
+        const cwSrc = targetW / fillSc, chSrc = targetH / fillSc;  // crop size in source px
+        const exX = srcW - cwSrc, exY = srcH - chSrc;
+        const rx = cropX * exX * ps, ry = cropY * exY * ps;
+        const rw = cwSrc * ps,       rh = chSrc * ps;
+
+        // Dim background
+        ctx.drawImage(srcImg, 0, 0, pw, ph);
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0, 0, pw, ph);
+
+        // Bright crop region
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(rx, ry, rw, rh);
+        ctx.clip();
+        ctx.drawImage(srcImg, 0, 0, pw, ph);
+        ctx.restore();
+
+        // Border
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(rx + 0.75, ry + 0.75, rw - 1.5, rh - 1.5);
+
+        // Corner handles
+        const hs = 6;
+        ctx.fillStyle = '#ffffff';
+        [[rx,ry],[rx+rw,ry],[rx,ry+rh],[rx+rw,ry+rh]].forEach(([hx,hy]) =>
+          ctx.fillRect(hx - hs/2, hy - hs/2, hs, hs));
+      } else {
+        ctx.drawImage(srcImg, 0, 0, pw, ph);
+      }
+    }
+
+    // ── Drag crop ───────────────────────────────────────────────────────────────
+    let drag = false, dsx, dsy, dcx, dcy;
+
+    const srcCv = document.getElementById('src-cv');
+
+    function evXY(e) {
+      const r = srcCv.getBoundingClientRect(), t = e.touches ? e.touches[0] : e;
+      return [t.clientX - r.left, t.clientY - r.top];
+    }
+
+    function dragStart(e) {
+      if (mode !== 'fill' || !srcImg) return;
+      e.preventDefault();
+      drag = true; srcCv.classList.add('dragging');
+      [dsx, dsy] = evXY(e); dcx = cropX; dcy = cropY;
+    }
+
+    function dragMove(e) {
+      if (!drag) return;
+      if (e.cancelable) e.preventDefault();
+      const [mx, my] = evXY(e);
+      const ps = Math.min(1, PREV_MAX / srcW, PREV_MAX / srcH);
+      const fillSc = Math.max(targetW / srcW, targetH / srcH);
+      const exX = srcW - targetW / fillSc, exY = srcH - targetH / fillSc;
+      cropX = exX > 0 ? Math.max(0, Math.min(1, dcx + (mx - dsx) / ps / exX)) : 0.5;
+      cropY = exY > 0 ? Math.max(0, Math.min(1, dcy + (my - dsy) / ps / exY)) : 0.5;
+      document.getElementById('cx').value = Math.round(cropX * 100);
+      document.getElementById('cy').value = Math.round(cropY * 100);
+      render();
+    }
+
+    function dragEnd() { drag = false; srcCv.classList.remove('dragging'); }
+
+    srcCv.addEventListener('mousedown',  dragStart);
+    srcCv.addEventListener('mousemove',  dragMove);
+    srcCv.addEventListener('mouseup',    dragEnd);
+    srcCv.addEventListener('mouseleave', dragEnd);
+    srcCv.addEventListener('touchstart', dragStart, { passive: false });
+    srcCv.addEventListener('touchmove',  dragMove,  { passive: false });
+    srcCv.addEventListener('touchend',   dragEnd);
+
+    // ── BMP generation ──────────────────────────────────────────────────────────
+    function w32(b, o, v) {
+      const u = v >>> 0;
+      b[o]=u&0xFF; b[o+1]=(u>>8)&0xFF; b[o+2]=(u>>16)&0xFF; b[o+3]=(u>>24)&0xFF;
+    }
+    function w16(b, o, v) { b[o]=v&0xFF; b[o+1]=(v>>8)&0xFF; }
+
+    function makeBmp() {
+      const rc = document.getElementById('res-cv');
+      const W = rc.width, H = rc.height;
+      const px = rc.getContext('2d').getImageData(0, 0, W, H).data;
+      const stride = Math.floor((W * 2 + 3) / 4) * 4;
+      const buf = new Uint8Array(66 + stride * H);
+      // File header
+      buf[0] = 0x42; buf[1] = 0x4D;
+      w32(buf,  2, 66 + stride * H);   // file size
+      w32(buf, 10, 66);                 // pixel data offset
+      // Info header
+      w32(buf, 14, 40);                 // BITMAPINFOHEADER size
+      w32(buf, 18, W);                  // width
+      w32(buf, 22, H);                  // height positive → bottom-up rows
+      w16(buf, 26, 1);                  // color planes
+      w16(buf, 28, 16);                 // bits per pixel
+      w32(buf, 30, 3);                  // BI_BITFIELDS
+      w32(buf, 34, stride * H);         // image data size
+      w32(buf, 38, 2835); w32(buf, 42, 2835); // pixels/meter
+      // RGB565 masks
+      w32(buf, 54, 0xF800);             // R mask
+      w32(buf, 58, 0x07E0);             // G mask
+      w32(buf, 62, 0x001F);             // B mask
+      // Pixel data — bottom-up (disk row 0 = image bottom row)
+      for (let row = 0; row < H; row++) {
+        const base = 66 + (H - 1 - row) * stride;
+        for (let col = 0; col < W; col++) {
+          const s = (row * W + col) * 4;
+          const v = ((px[s]   >> 3) << 11)   // R5
+                  | ((px[s+1] >> 2) <<  5)   // G6
+                  |  (px[s+2] >> 3);          // B5
+          buf[base + col * 2]     = v & 0xFF;
+          buf[base + col * 2 + 1] = (v >> 8) & 0xFF;
+        }
+      }
+      return buf;
+    }
+
+    // ── Upload / Download ───────────────────────────────────────────────────────
+    async function doUpload() {
+      if (!srcImg) return;
+      const fname = document.getElementById('fname').value.trim();
+      if (!fname) { setStatus('Enter a filename', 'err'); return; }
+      setStatus('Converting…', 'dim');
+      let bmp;
+      try { bmp = makeBmp(); } catch (e) { setStatus('Convert error: ' + e.message, 'err'); return; }
+      setStatus('Uploading ' + fname + '…', 'dim');
+      try {
+        const r = await fetch('/upload?name=' + encodeURIComponent(fname), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: bmp
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
+        setStatus('✓ Uploaded as ' + fname, 'ok');
+      } catch (e) {
+        setStatus('Upload failed: ' + e.message, 'err');
+      }
+    }
+
+    function doDownload() {
+      if (!srcImg) return;
+      const fname = document.getElementById('fname').value.trim() || 'image.bmp';
+      const url = URL.createObjectURL(new Blob([makeBmp()], { type: 'image/bmp' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = fname; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById('status');
+      el.textContent = msg; el.className = cls || '';
+    }
+  </script>
+</body>
+</html>
