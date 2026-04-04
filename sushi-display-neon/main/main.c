@@ -15,6 +15,8 @@
 #include "esp_timer.h"
 
 #include "esp_spiffs.h"
+#include <dirent.h>
+#include <sys/stat.h>
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
@@ -319,15 +321,206 @@ static bool             s_wifi_prereqs_done = false;
 
 static esp_err_t hello_get_handler(httpd_req_t *req)
 {
-    static const char html[] =
-        "<!DOCTYPE html>"
-        "<html><head><meta charset=\"utf-8\"><title>Sushi Display</title></head>"
-        "<body style=\"font-family:sans-serif;text-align:center;padding:2em\">"
-        "<h1>Hello World!</h1>"
-        "<p>Sushi Display is running.</p>"
-        "</body></html>";
+    FILE *f = fopen("/spiffs/index.html", "r");
+    if (!f) {
+        ESP_LOGE(TAG, "index.html not found on SPIFFS");
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "index.html not found");
+        return ESP_FAIL;
+    }
+
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
+            fclose(f);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);  // signal end of chunked response
+    return ESP_OK;
+}
+
+// ── File-manager helpers ───────────────────────────────────────────────────────
+
+static bool get_query_param(httpd_req_t *req, const char *key, char *dst, size_t dst_len)
+{
+    char qbuf[256];
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) != ESP_OK) return false;
+    return httpd_query_key_value(qbuf, key, dst, dst_len) == ESP_OK;
+}
+
+// Non-empty, ≤31 chars (SPIFFS default name limit), no path separators
+static bool valid_filename(const char *name)
+{
+    if (!name || name[0] == '\0') return false;
+    size_t len = strlen(name);
+    if (len > 31) return false;
+    for (size_t i = 0; i < len; i++)
+        if (name[i] == '/' || name[i] == '\\') return false;
+    return !(len == 1 && name[0] == '.') &&
+           !(len == 2 && name[0] == '.' && name[1] == '.');
+}
+
+// ── GET /api/files — JSON list of all SPIFFS files with sizes ─────────────────
+static esp_err_t api_files_handler(httpd_req_t *req)
+{
+    size_t total = 0, used = 0;
+    esp_spiffs_info(NULL, &total, &used);
+
+    DIR *dir = opendir("/spiffs");
+    if (!dir) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "opendir failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf), "{\"total\":%zu,\"used\":%zu,\"files\":[", total, used);
+    httpd_resp_send_chunk(req, buf, n);
+
+    struct dirent *entry;
+    bool first = true;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;   // skip . and ..
+
+        char path[272];  // "/spiffs/" (8) + NAME_MAX (255) + NUL
+        snprintf(path, sizeof(path), "/spiffs/%s", entry->d_name);
+        struct stat st;
+        long fsize = (stat(path, &st) == 0) ? (long)st.st_size : -1;
+
+        // JSON-escape " and \ in the filename
+        char esc[520];  // worst case: every char escaped + NUL
+        size_t ei = 0;
+        for (const char *p = entry->d_name; *p && ei < sizeof(esc) - 2; p++) {
+            if (*p == '"' || *p == '\\') esc[ei++] = '\\';
+            esc[ei++] = *p;
+        }
+        esc[ei] = '\0';
+
+        n = snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"size\":%ld}",
+                     first ? "" : ",", esc, fsize);
+        httpd_resp_send_chunk(req, buf, n);
+        first = false;
+    }
+    closedir(dir);
+
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// ── GET /download?name=<file> — stream file to client ─────────────────────────
+static esp_err_t download_handler(httpd_req_t *req)
+{
+    char name[64];
+    if (!get_query_param(req, "name", name, sizeof(name)) || !valid_filename(name)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid 'name'");
+        return ESP_FAIL;
+    }
+
+    char path[72];
+    snprintf(path, sizeof(path), "/spiffs/%s", name);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
+        return ESP_FAIL;
+    }
+
+    char disp[96];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", name);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+
+    char buf[512];
+    size_t rd;
+    while ((rd = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, (ssize_t)rd) != ESP_OK) {
+            fclose(f);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// ── POST /upload?name=<file>  (request body = raw file bytes) ─────────────────
+#define UPLOAD_BUF_SZ 1024
+
+static esp_err_t upload_handler(httpd_req_t *req)
+{
+    char name[64];
+    if (!get_query_param(req, "name", name, sizeof(name)) || !valid_filename(name)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid 'name'");
+        return ESP_FAIL;
+    }
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty upload");
+        return ESP_FAIL;
+    }
+
+    char path[72];
+    snprintf(path, sizeof(path), "/spiffs/%s", name);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cannot create file");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(UPLOAD_BUF_SZ);
+    if (!buf) {
+        fclose(f); remove(path);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+
+    size_t remaining = req->content_len;
+    bool ok = true;
+    while (remaining > 0) {
+        size_t want = remaining < UPLOAD_BUF_SZ ? remaining : UPLOAD_BUF_SZ;
+        int got = httpd_req_recv(req, buf, want);
+        if (got <= 0) { ok = false; break; }
+        if (fwrite(buf, 1, (size_t)got, f) != (size_t)got) { ok = false; break; }
+        remaining -= (size_t)got;
+    }
+    free(buf);
+    fclose(f);
+
+    if (!ok) {
+        remove(path);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "upload failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// ── POST /delete?name=<file> — remove a file from SPIFFS ──────────────────────
+static esp_err_t delete_handler(httpd_req_t *req)
+{
+    char name[64];
+    if (!get_query_param(req, "name", name, sizeof(name)) || !valid_filename(name)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid 'name'");
+        return ESP_FAIL;
+    }
+
+    char path[72];
+    snprintf(path, sizeof(path), "/spiffs/%s", name);
+    if (remove(path) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -366,14 +559,21 @@ static void wifi_http_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG, "WiFi AP started: SSID=%s  ->  http://192.168.4.1/", WIFI_AP_SSID);
 
-    httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
+    httpd_config_t hcfg    = HTTPD_DEFAULT_CONFIG();
+    hcfg.stack_size        = 8192;  // file I/O needs more than the 4 KB default
+    hcfg.recv_wait_timeout = 30;    // seconds; needed for large file uploads
+    hcfg.max_uri_handlers  = 8;
     if (httpd_start(&s_httpd, &hcfg) == ESP_OK) {
-        static const httpd_uri_t root = {
-            .uri     = "/",
-            .method  = HTTP_GET,
-            .handler = hello_get_handler,
-        };
-        httpd_register_uri_handler(s_httpd, &root);
+        static const httpd_uri_t uri_root     = { .uri="/",          .method=HTTP_GET,  .handler=hello_get_handler  };
+        static const httpd_uri_t uri_files    = { .uri="/api/files", .method=HTTP_GET,  .handler=api_files_handler  };
+        static const httpd_uri_t uri_download = { .uri="/download",  .method=HTTP_GET,  .handler=download_handler   };
+        static const httpd_uri_t uri_upload   = { .uri="/upload",    .method=HTTP_POST, .handler=upload_handler     };
+        static const httpd_uri_t uri_delete   = { .uri="/delete",    .method=HTTP_POST, .handler=delete_handler     };
+        httpd_register_uri_handler(s_httpd, &uri_root);
+        httpd_register_uri_handler(s_httpd, &uri_files);
+        httpd_register_uri_handler(s_httpd, &uri_download);
+        httpd_register_uri_handler(s_httpd, &uri_upload);
+        httpd_register_uri_handler(s_httpd, &uri_delete);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "HTTP server failed to start");
@@ -522,6 +722,7 @@ static void display_white_screens(void)
         READ_ANIM_HDR(walk_f, walk_w, walk_h, walk_frames, walk_fps, walk_us, walk_ofs);
         READ_ANIM_HDR(fly_f,  fly_w,  fly_h,  fly_frames,  fly_fps,  fly_us,  fly_ofs);
         READ_ANIM_HDR(idle_f, idle_w, idle_h, idle_frames, idle_fps, idle_us, idle_ofs);
+        (void)idle_us;  // frame timing for idle is driven by IDLE_FRAME_US[], not fps
         #undef READ_ANIM_HDR
 
         // Allocate frame buffer large enough for whichever is biggest
@@ -547,6 +748,7 @@ static void display_white_screens(void)
         // Centred start position (based on walk animation — both should be same size)
         int draw_w = (walk_w * sc) < LCD_H_RES ? (walk_w * sc) : LCD_H_RES;
         int draw_h = (walk_h * sc) < LCD_V_RES ? (walk_h * sc) : LCD_V_RES;
+        (void)draw_h;
         s_walk_x = (LCD_H_RES - draw_w) / 2;
         s_walk_y = 211 ;
 
@@ -732,7 +934,7 @@ void app_main(void)
     esp_vfs_spiffs_conf_t spiffs_conf = {
         .base_path            = "/spiffs",
         .partition_label      = NULL,
-        .max_files            = 5,
+        .max_files            = 8,
         .format_if_mount_failed = true,
     };
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs_conf));

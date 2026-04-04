@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sushi Display — Files</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:sans-serif;background:#e8f4f8;color:#1a1a2e;padding:1em;max-width:700px;margin:0 auto}
+    h1{margin-bottom:.75em;font-size:1.6em}
+    h2{font-size:1.05em;font-weight:600;margin:.75em 0 .4em;color:#334}
+    .card{background:#fff;border-radius:8px;padding:1em;box-shadow:0 1px 4px rgba(0,0,0,.12);margin-bottom:1em}
+    /* storage bar */
+    .bar-label{font-size:.85em;color:#555;margin-top:.35em}
+    .bar-wrap{background:#dde;border-radius:4px;height:10px;overflow:hidden;margin-top:.3em}
+    .bar{background:#3a7bd5;height:100%;transition:width .4s}
+    /* file table */
+    table{width:100%;border-collapse:collapse;font-size:.88em}
+    th{text-align:left;padding:.4em .5em;border-bottom:2px solid #dde;color:#556;font-weight:600}
+    td{padding:.32em .5em;border-bottom:1px solid #eef;word-break:break-all;vertical-align:middle}
+    .sz{white-space:nowrap;color:#667;text-align:right;width:7em}
+    .act{white-space:nowrap;text-align:right;width:7em}
+    /* buttons */
+    button{padding:.28em .65em;border:none;border-radius:4px;cursor:pointer;font-size:.82em;font-weight:600}
+    .btn-dl{background:#3a7bd5;color:#fff}
+    .btn-dl:hover{background:#2f6abf}
+    .btn-del{background:#d03050;color:#fff;margin-left:.3em}
+    .btn-del:hover{background:#b02040}
+    /* upload area */
+    #drop-zone{border:2px dashed #aac;border-radius:6px;padding:1.2em;text-align:center;color:#779;cursor:pointer;transition:background .2s}
+    #drop-zone.over{background:#d6eaf8;border-color:#3a7bd5}
+    #file-input{display:none}
+    #upload-btn{margin-top:.6em;background:#28a745;color:#fff;padding:.4em 1.2em;font-size:.9em}
+    #upload-btn:disabled{opacity:.45;cursor:default}
+    .prog-wrap{display:none;margin-top:.5em}
+    progress{width:100%;height:8px;border-radius:4px}
+    #status{margin-top:.4em;font-size:.82em;color:#556;min-height:1.2em}
+    .empty{color:#aab;text-align:center;padding:1.2em;font-style:italic}
+    .refresh-btn{font-size:.75em;background:#eef;color:#334;margin-left:.5em;vertical-align:middle}
+  </style>
+</head>
+<body>
+  <h1>🍣 Sushi Display</h1>
+
+  <div class="card">
+    <h2>Storage</h2>
+    <div class="bar-label" id="disk-text">—</div>
+    <div class="bar-wrap"><div class="bar" id="bar" style="width:0%"></div></div>
+  </div>
+
+  <div class="card">
+    <h2>Files <button class="refresh-btn" onclick="loadFiles()">↻ refresh</button></h2>
+    <table>
+      <thead><tr><th>Name</th><th class="sz">Size</th><th class="act"></th></tr></thead>
+      <tbody id="file-list"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Upload</h2>
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()"
+         ondragover="event.preventDefault();this.classList.add('over')"
+         ondragleave="this.classList.remove('over')"
+         ondrop="onDrop(event)">
+      Tap to choose files, or drag &amp; drop here
+    </div>
+    <input id="file-input" type="file" multiple onchange="onFilePick(event)">
+    <div style="text-align:center">
+      <button id="upload-btn" onclick="startUpload()" disabled>Upload</button>
+    </div>
+    <div class="prog-wrap" id="prog-wrap"><progress id="prog" value="0" max="1"></progress></div>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    let pendingFiles = [];
+
+    function fmt(b) {
+      if (b < 0)       return '?';
+      if (b < 1024)    return b + ' B';
+      if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+      return (b / 1048576).toFixed(2) + ' MB';
+    }
+
+    function esc(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&#34;');
+    }
+
+    async function loadFiles() {
+      const tbody = document.getElementById('file-list');
+      tbody.innerHTML = '<tr><td colspan="3" class="empty">Loading…</td></tr>';
+      try {
+        const d = await fetch('/api/files').then(r => r.json());
+        const pct = d.total ? Math.min(100, Math.round(d.used / d.total * 100)) : 0;
+        document.getElementById('disk-text').textContent =
+          fmt(d.used) + ' used of ' + fmt(d.total) + ' (' + pct + '%)';
+        document.getElementById('bar').style.width = pct + '%';
+
+        if (!d.files || !d.files.length) {
+          tbody.innerHTML = '<tr><td colspan="3" class="empty">No files on SPIFFS</td></tr>';
+          return;
+        }
+        d.files.sort((a, b) => a.name.localeCompare(b.name));
+        tbody.innerHTML = d.files.map(f =>
+          '<tr>' +
+          '<td>' + esc(f.name) + '</td>' +
+          '<td class="sz">' + fmt(f.size) + '</td>' +
+          '<td class="act">' +
+            '<button class="btn-dl" title="Download" onclick="dl(\'' + esc(f.name) + '\')">↓</button>' +
+            '<button class="btn-del" title="Delete"   onclick="del(\'' + esc(f.name) + '\')">✕</button>' +
+          '</td></tr>'
+        ).join('');
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="3" class="empty">Error: ' + esc(e.message) + '</td></tr>';
+      }
+    }
+
+    function dl(name) {
+      window.location = '/download?name=' + encodeURIComponent(name);
+    }
+
+    async function del(name) {
+      if (!confirm('Delete "' + name + '"?')) return;
+      const r = await fetch('/delete?name=' + encodeURIComponent(name), { method: 'POST' });
+      if (r.ok) loadFiles();
+      else alert('Delete failed (' + r.status + ')');
+    }
+
+    function onFilePick(e) {
+      pendingFiles = [...e.target.files];
+      document.getElementById('upload-btn').disabled = pendingFiles.length === 0;
+      document.getElementById('status').textContent =
+        pendingFiles.length ? pendingFiles.length + ' file(s) ready' : '';
+    }
+
+    function onDrop(e) {
+      e.preventDefault();
+      document.getElementById('drop-zone').classList.remove('over');
+      pendingFiles = [...e.dataTransfer.files];
+      document.getElementById('upload-btn').disabled = pendingFiles.length === 0;
+      document.getElementById('status').textContent =
+        pendingFiles.length + ' file(s) ready';
+    }
+
+    async function startUpload() {
+      if (!pendingFiles.length) return;
+      const btn  = document.getElementById('upload-btn');
+      const pw   = document.getElementById('prog-wrap');
+      const prog = document.getElementById('prog');
+      const stat = document.getElementById('status');
+
+      btn.disabled = true;
+      pw.style.display = 'block';
+
+      for (let i = 0; i < pendingFiles.length; i++) {
+        const file = pendingFiles[i];
+        stat.textContent = 'Uploading ' + file.name + ' (' + (i + 1) + '/' + pendingFiles.length + ')…';
+        prog.value = i / pendingFiles.length;
+        try {
+          const r = await fetch('/upload?name=' + encodeURIComponent(file.name), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: file
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
+        } catch (e) {
+          alert('Upload failed: ' + e.message);
+          btn.disabled = false;
+          return;
+        }
+      }
+
+      prog.value = 1;
+      stat.textContent = '✓ Upload complete';
+      pendingFiles = [];
+      document.getElementById('file-input').value = '';
+      setTimeout(() => { pw.style.display = 'none'; stat.textContent = ''; }, 3000);
+      btn.disabled = true;
+      loadFiles();
+    }
+
+    loadFiles();
+  </script>
+</body>
+</html>
