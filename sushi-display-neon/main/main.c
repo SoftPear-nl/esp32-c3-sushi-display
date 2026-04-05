@@ -720,13 +720,19 @@ static esp_err_t api_sequence_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
-    int rcvd = httpd_req_recv(req, buf, req->content_len);
-    if (rcvd <= 0) {
-        free(buf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv error");
-        return ESP_FAIL;
+    size_t remaining = req->content_len;
+    size_t offset = 0;
+    while (remaining > 0) {
+        int r = httpd_req_recv(req, buf + offset, remaining);
+        if (r <= 0) {
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv error");
+            return ESP_FAIL;
+        }
+        offset += (size_t)r;
+        remaining -= (size_t)r;
     }
-    buf[rcvd] = '\0';
+    buf[offset] = '\0';
     cJSON *arr = cJSON_Parse(buf);
     if (!arr || !cJSON_IsArray(arr)) {
         free(buf); cJSON_Delete(arr);
@@ -744,7 +750,7 @@ static esp_err_t api_sequence_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cannot write file");
         return ESP_FAIL;
     }
-    fwrite(buf, 1, (size_t)rcvd, f);
+    fwrite(buf, 1, offset, f);
     fclose(f);
     free(buf);
     int count = 0;
