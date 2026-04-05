@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "jpeg_decoder.h"
 
 static const char *TAG = "disp_seq";
 
@@ -132,6 +133,120 @@ static uint16_t *bmp_load(const char *path, bmp_info_t *info_out)
 }
 
 // ---------------------------------------------------------------------------
+// JPEG loader
+// ---------------------------------------------------------------------------
+
+/**
+ * Scan a JPEG byte stream for an SOF marker and extract image dimensions.
+ * Returns true on success.
+ */
+static bool jpeg_get_dims(const uint8_t *buf, size_t len, uint32_t *w, uint32_t *h)
+{
+    if (len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) return false;
+    size_t i = 2;
+    while (i + 3 < len) {
+        if (buf[i] != 0xFF) return false;
+        uint8_t marker = buf[i + 1];
+        if (marker == 0xD9) return false; // EOI
+        if (marker == 0x01 || marker == 0xFF) { i += (marker == 0xFF ? 1 : 2); continue; }
+        uint16_t seg_len = (uint16_t)((buf[i + 2] << 8) | buf[i + 3]);
+        // SOF0..SOFF excluding FFC4 (DHT), FFC8 (JPG), FFCC (DAC)
+        if ((marker & 0xF0) == 0xC0 && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+            if (i + 8 < len) {
+                *h = (uint32_t)((buf[i + 5] << 8) | buf[i + 6]);
+                *w = (uint32_t)((buf[i + 7] << 8) | buf[i + 8]);
+                return (*w > 0 && *h > 0);
+            }
+        }
+        i += 2 + seg_len;
+    }
+    return false;
+}
+
+/**
+ * Load a JPEG from SPIFFS into a freshly malloc'd PSRAM buffer.
+ *
+ * Output: top-row first, 2 bytes/pixel, big-endian RGB565 (ready for ST7789).
+ * Returns NULL on failure. Caller must free().
+ */
+static uint16_t *jpeg_load(const char *path, bmp_info_t *info_out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { ESP_LOGE(TAG, "jpeg_load: cannot open '%s'", path); return NULL; }
+    fseek(f, 0, SEEK_END);
+    long file_sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_sz <= 0) { fclose(f); return NULL; }
+
+    uint8_t *jpeg_buf = heap_caps_malloc((size_t)file_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpeg_buf) {
+        ESP_LOGE(TAG, "jpeg_load: OOM for source buffer (%ld bytes)", file_sz);
+        fclose(f); return NULL;
+    }
+    size_t remaining = (size_t)file_sz, offset = 0;
+    while (remaining > 0) {
+        size_t r = fread(jpeg_buf + offset, 1, remaining, f);
+        if (r == 0) break;
+        offset += r; remaining -= r;
+    }
+    fclose(f);
+
+    uint32_t w = 0, h = 0;
+    if (!jpeg_get_dims(jpeg_buf, offset, &w, &h)) {
+        ESP_LOGE(TAG, "jpeg_load: cannot parse dimensions '%s'", path);
+        free(jpeg_buf); return NULL;
+    }
+    ESP_LOGI(TAG, "jpeg_load: '%s' %ux%u", path, w, h);
+
+    size_t out_sz = (size_t)w * h * 2;
+    uint16_t *out_buf = heap_caps_malloc(out_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out_buf) {
+        ESP_LOGE(TAG, "jpeg_load: OOM for output buffer (%u bytes)", (unsigned)out_sz);
+        free(jpeg_buf); return NULL;
+    }
+
+    esp_jpeg_image_cfg_t cfg = {
+        .indata       = jpeg_buf,
+        .indata_size  = (uint32_t)offset,
+        .outbuf       = (uint8_t *)out_buf,
+        .outbuf_size  = (uint32_t)out_sz,
+        .out_format   = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale    = JPEG_IMAGE_SCALE_0,
+        .flags        = { .swap_color_bytes = 1 }, // LE->BE for ST7789
+    };
+    esp_jpeg_image_output_t out_info;
+    esp_err_t err = esp_jpeg_decode(&cfg, &out_info);
+    free(jpeg_buf);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "jpeg_load: decode failed (%d) '%s'", err, path);
+        free(out_buf); return NULL;
+    }
+
+    if (info_out) {
+        info_out->width      = (int32_t)out_info.width;
+        info_out->height     = (int32_t)out_info.height;
+        info_out->row_stride = (uint32_t)out_info.width * 2;
+        info_out->top_down   = true;
+    }
+    return out_buf;
+}
+
+/**
+ * Load either a BMP or JPEG depending on file extension.
+ * Extension matching is case-insensitive (.jpg/.JPG/.jpeg/.JPEG → JPEG, else BMP).
+ */
+static uint16_t *image_load(const char *path, bmp_info_t *info_out)
+{
+    const char *ext = strrchr(path, '.');
+    if (ext && (strcmp(ext, ".jpg")  == 0 || strcmp(ext, ".JPG")  == 0 ||
+                strcmp(ext, ".jpeg") == 0 || strcmp(ext, ".JPEG") == 0)) {
+        return jpeg_load(path, info_out);
+    }
+    return bmp_load(path, info_out);
+}
+
+// ---------------------------------------------------------------------------
 // Utility: fill a screen with black
 // ---------------------------------------------------------------------------
 
@@ -160,7 +275,7 @@ static void clear_screen(esp_lcd_panel_handle_t panel)
 static void scene_static(esp_lcd_panel_handle_t panel, const scene_t *s)
 {
     bmp_info_t info;
-    uint16_t *img = bmp_load(s->file_path, &info);
+    uint16_t *img = image_load(s->file_path, &info);
     if (!img) return;
 
     int draw_w = info.width  < LCD_W ? info.width  : LCD_W;
@@ -208,7 +323,7 @@ static void scene_pan(esp_lcd_panel_handle_t panel, const scene_t *s)
 {
     // Load entire image into PSRAM first — avoids SPIFFS fseek-per-row in the loop
     bmp_info_t info;
-    uint16_t *img = bmp_load(s->file_path, &info);
+    uint16_t *img = image_load(s->file_path, &info);
     if (!img) return;
 
     bool horiz = (s->pan_dir == DIR_LEFT || s->pan_dir == DIR_RIGHT);
@@ -378,7 +493,7 @@ void display_sequence_run(
 static void scene_bounce(esp_lcd_panel_handle_t panel, const scene_t *s)
 {
     bmp_info_t info;
-    uint16_t *img_buf = bmp_load(s->file_path, &info);
+    uint16_t *img_buf = image_load(s->file_path, &info);
     if (!img_buf) return;
 
     int img_w = info.width  < LCD_W ? info.width  : LCD_W;

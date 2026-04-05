@@ -1,7 +1,7 @@
 [
   {
     "type": "STATIC",
-    "file_path": "/spiffs/BOWL.bmp",
+    "file_path": "/spiffs/BOWL.jpg",
     "screen": 1,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -19,7 +19,7 @@
   },
   {
     "type": "PAN",
-    "file_path": "/spiffs/WAX_DISHES_.bmp",
+    "file_path": "/spiffs/WAX_DISHES_.jpg",
     "screen": 2,
     "duration_ms": 3000,
     "pan_dir": "LEFT",
@@ -37,7 +37,7 @@
   },
   {
     "type": "PAN",
-    "file_path": "/spiffs/ZANMAI_SUSHI.bmp",
+    "file_path": "/spiffs/ZANMAI_SUSHI.jpg",
     "screen": 1,
     "duration_ms": 3000,
     "pan_dir": "RIGHT",
@@ -55,7 +55,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/ZANMAI_LOGO.bmp",
+    "file_path": "/spiffs/ZANMAI_LOGO.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -91,7 +91,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/EXPO_SAL.bmp",
+    "file_path": "/spiffs/EXPO_SAL.jpg",
     "screen": 1,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -109,7 +109,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/EXPO.bmp",
+    "file_path": "/spiffs/EXPO.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -127,7 +127,7 @@
   },
   {
     "type": "BOUNCE",
-    "file_path": "/spiffs/SUSHIRO-LOGO.bmp",
+    "file_path": "/spiffs/SUSHIRO-LOGO.jpg",
     "screen": 1,
     "duration_ms": 3000,
     "pan_dir": "LEFT",
@@ -145,7 +145,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/SUSHIRO_SUSHI.bmp",
+    "file_path": "/spiffs/SUSHIRO_SUSHI.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "DOWN",
@@ -163,7 +163,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/DONQI.bmp",
+    "file_path": "/spiffs/DONQI.jpg",
     "screen": 1,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -181,7 +181,7 @@
   },
   {
     "type": "PAN",
-    "file_path": "/spiffs/DONQI2.bmp",
+    "file_path": "/spiffs/DONQI2.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "RIGHT",
@@ -199,7 +199,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/SUSHIRO_TEA.bmp",
+    "file_path": "/spiffs/SUSHIRO_TEA.jpg",
     "screen": 1,
     "duration_ms": 10000,
     "pan_dir": "DOWN",
@@ -217,7 +217,7 @@
   },
   {
     "type": "BOUNCE",
-    "file_path": "/spiffs/SUSHIRO_LOGO_2.bmp",
+    "file_path": "/spiffs/SUSHIRO_LOGO_2.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -235,7 +235,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/TAKOYAKI.bmp",
+    "file_path": "/spiffs/TAKOYAKI.jpg",
     "screen": 1,
     "duration_ms": 3000,
     "pan_dir": "LEFT",
@@ -253,7 +253,7 @@
   },
   {
     "type": "PAN",
-    "file_path": "/spiffs/OKINOMI.bmp",
+    "file_path": "/spiffs/OKINOMI.jpg",
     "screen": 2,
     "duration_ms": 3000,
     "pan_dir": "RIGHT",
@@ -271,7 +271,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/KIRBY_CAFE.bmp",
+    "file_path": "/spiffs/KIRBY_CAFE.jpg",
     "screen": 1,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -289,7 +289,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/FISH_CHIPS.bmp",
+    "file_path": "/spiffs/FISH_CHIPS.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -307,7 +307,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/OSAKA.bmp",
+    "file_path": "/spiffs/OSAKA.jpg",
     "screen": 1,
     "duration_ms": 10000,
     "pan_dir": "LEFT",
@@ -325,7 +325,7 @@
   },
   {
     "type": "STATIC",
-    "file_path": "/spiffs/SAKE.bmp",
+    "file_path": "/spiffs/SAKE.jpg",
     "screen": 2,
     "duration_ms": 10000,
     "pan_dir": "LEFT",

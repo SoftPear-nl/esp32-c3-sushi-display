@@ -26,6 +26,7 @@
 #include "neon_letter_service.h"
 #include "display_sequence.h"
 #include "font.h"
+#include "jpeg_decoder.h"
 
 static const char *TAG = "main";
 
@@ -893,7 +894,7 @@ static void wifi_http_stop(void)
     ESP_LOGI(TAG, "WiFi AP stopped");
 }
 
-// -------------------- Display mode: kirb_back.bmp + kirb_walk.bin overlay --------------------
+// -------------------- Display mode: kirb_back.jpg + kirb_walk.bin overlay --------------------
 static void display_white_screens(void)
 {
     uint16_t *bg1 = NULL;  // 240×LCD_V_RES, left  half → panel 1
@@ -901,47 +902,52 @@ static void display_white_screens(void)
 
     // ── Load and split background ─────────────────────────────────────────────
     do {
-        FILE *f = fopen("/spiffs/kirb_back.bmp", "rb");
-        if (!f) { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_back.bmp"); break; }
+        FILE *f = fopen("/spiffs/kirb_back.jpg", "rb");
+        if (!f) { ESP_LOGE(TAG, "Cannot open /spiffs/kirb_back.jpg"); break; }
+        fseek(f, 0, SEEK_END);
+        long file_sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (file_sz <= 0) { fclose(f); break; }
 
-        uint8_t hdr[66];
-        if (fread(hdr, 1, sizeof(hdr), f) < sizeof(hdr) ||
-                hdr[0] != 'B' || hdr[1] != 'M') {
-            ESP_LOGE(TAG, "kirb_back.bmp: bad header");
-            fclose(f); break;
-        }
-
-        uint32_t po     = (uint32_t)(hdr[10] | (hdr[11]<<8) | (hdr[12]<<16) | (hdr[13]<<24));
-        int32_t  w      = (int32_t) (hdr[18] | (hdr[19]<<8) | (hdr[20]<<16) | (hdr[21]<<24));
-        int32_t  h      = (int32_t) (hdr[22] | (hdr[23]<<8) | (hdr[24]<<16) | (hdr[25]<<24));
-        int      width  = w < 0 ? -w : w;
-        int      height = h < 0 ? -h : h;
-        bool     top_down   = h < 0;
-        uint32_t row_stride = ((uint32_t)(width * 2 + 3) / 4) * 4;
-
-        uint16_t *img     = heap_caps_malloc((size_t)width * height * 2,
+        uint8_t *jpeg_buf = heap_caps_malloc((size_t)file_sz,
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        uint16_t *row_buf = malloc(row_stride);
-        if (!img || !row_buf) {
-            ESP_LOGE(TAG, "kirb_back.bmp: OOM");
-            free(img); free(row_buf); fclose(f); break;
-        }
-
-        fseek(f, (long)po, SEEK_SET);
-        for (int disk_row = 0; disk_row < height; disk_row++) {
-            size_t got = fread(row_buf, 1, row_stride, f);
-            if (got < (size_t)row_stride)
-                memset((uint8_t *)row_buf + got, 0, row_stride - got);
-            int img_row = top_down ? disk_row : (height - 1 - disk_row);
-            uint16_t *dst = img + (size_t)img_row * width;
-            for (int c = 0; c < width; c++) {
-                uint16_t px = row_buf[c];
-                dst[c] = (uint16_t)((px >> 8) | (px << 8)); // LE→BE
-            }
-            if ((disk_row & 15) == 15) vTaskDelay(1);
-        }
-        free(row_buf);
+        if (!jpeg_buf) { ESP_LOGE(TAG, "kirb_back.jpg: OOM src"); fclose(f); break; }
+        size_t rem = (size_t)file_sz, off = 0;
+        while (rem > 0) { size_t r = fread(jpeg_buf + off, 1, rem, f); if (!r) break; off += r; rem -= r; }
         fclose(f);
+
+        // Quick SOF scan for dimensions
+        int      width = 0, height = 0;
+        for (size_t _i = 2; _i + 8 < off; ) {
+            if (jpeg_buf[_i] != 0xFF) break;
+            uint8_t _m = jpeg_buf[_i+1];
+            uint16_t _l = (uint16_t)((jpeg_buf[_i+2]<<8)|jpeg_buf[_i+3]);
+            if ((_m & 0xF0) == 0xC0 && _m != 0xC4 && _m != 0xC8 && _m != 0xCC) {
+                height = (jpeg_buf[_i+5]<<8)|jpeg_buf[_i+6];
+                width  = (jpeg_buf[_i+7]<<8)|jpeg_buf[_i+8];
+                break;
+            }
+            _i += 2 + _l;
+        }
+        if (!width || !height) { ESP_LOGE(TAG, "kirb_back.jpg: cannot parse dims"); free(jpeg_buf); break; }
+
+        uint16_t *img = heap_caps_malloc((size_t)width * height * 2,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!img) { ESP_LOGE(TAG, "kirb_back.jpg: OOM dst"); free(jpeg_buf); break; }
+
+        esp_jpeg_image_cfg_t _jcfg = {
+            .indata      = jpeg_buf, .indata_size  = (uint32_t)off,
+            .outbuf      = (uint8_t *)img, .outbuf_size = (uint32_t)(width * height * 2),
+            .out_format  = JPEG_IMAGE_FORMAT_RGB565,
+            .out_scale   = JPEG_IMAGE_SCALE_0,
+            .flags       = { .swap_color_bytes = 1 },
+        };
+        esp_jpeg_image_output_t _jout;
+        esp_err_t _jerr = esp_jpeg_decode(&_jcfg, &_jout);
+        free(jpeg_buf);
+        if (_jerr != ESP_OK) { ESP_LOGE(TAG, "kirb_back.jpg: decode err %d", _jerr); free(img); break; }
+        width  = (int)_jout.width;
+        height = (int)_jout.height;
 
         int bg_rows = height < LCD_V_RES ? height : LCD_V_RES;
         bg1 = heap_caps_calloc((size_t)LCD_H_RES * LCD_V_RES, 2,
@@ -1175,15 +1181,15 @@ static const scene_t s_display_sequence[] = {
     // 1. Static zanmai.bmp on screen 1  ──┐ run simultaneously
     {                                      //  │
         .type        = SCENE_STATIC,       //  │
-        .file_path   = "/spiffs/zanmai.bmp",
+        .file_path   = "/spiffs/zanmai.jpg",
         .screen      = SCREEN_1,
         .duration_ms = 3000,
         .parallel    = true,  // <-- paired with the scene below
     },
-    // 2. Pan okinomi.bmp on screen 2    ──┘
+    // 2. Pan okinomi.jpg on screen 2    ──┘
     {
         .type        = SCENE_PAN,
-        .file_path   = "/spiffs/okinomi.bmp",
+        .file_path   = "/spiffs/okinomi.jpg",
         .screen      = SCREEN_2,
         .pan_dir     = DIR_LEFT,
         .pan_step_ms = 80,
@@ -1192,7 +1198,7 @@ static const scene_t s_display_sequence[] = {
     // 3. Bounce sushiro.bmp on screen 1  ──┐ run simultaneously
     {                                       //  │
         .type            = SCENE_BOUNCE,    //  │
-        .file_path       = "/spiffs/sushiro.bmp",
+        .file_path       = "/spiffs/sushiro.jpg",
         .screen          = SCREEN_1,
         .bounce_dx       = 3,
         .bounce_dy       = 2,
@@ -1200,10 +1206,10 @@ static const scene_t s_display_sequence[] = {
         .bounce_dur_ms   = 6000,
         .parallel        = true,  // <-- paired with the scene below
     },
-    // 4. Static zanmai.bmp on screen 2  ──┘
+    // 4. Static zanmai.jpg on screen 2  ──┘
     {
         .type        = SCENE_STATIC,
-        .file_path   = "/spiffs/zanmai.bmp",
+        .file_path   = "/spiffs/zanmai.jpg",
         .screen      = SCREEN_2,
         .duration_ms = 6000,
     },

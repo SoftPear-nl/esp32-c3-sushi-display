@@ -57,7 +57,7 @@
          ondragover="event.preventDefault();this.classList.add('over')"
          ondragleave="this.classList.remove('over')"
          ondrop="onDrop(event)">
-      Tap or drag an image here — converts to 16-bpp BMP for the display
+      Tap or drag an image here — converts to JPEG (quality 100) for the display
     </div>
     <input id="file-input" type="file" accept="image/*" onchange="loadFile(event.target.files[0])">
     <div id="src-info" style="font-size:.82em;color:#556;margin-top:.3em"></div>
@@ -126,7 +126,7 @@
     </div>
     <div class="row" style="margin-top:.35em">
       <button class="btn-p" onclick="doUpload()">⬆ Convert &amp; Upload</button>
-      <button class="btn-s" onclick="doDownload()">↓ Download BMP</button>
+      <button class="btn-s" onclick="doDownload()">↓ Download JPEG</button>
     </div>
     <div id="status"></div>
   </div>
@@ -159,7 +159,7 @@
         const base = file.name.replace(/\.[^.]+$/, '')
                                .replace(/[^a-zA-Z0-9_-]/g, '_')
                                .slice(0, 27);
-        document.getElementById('fname').value = base + '.bmp';
+        document.getElementById('fname').value = base + '.jpg';
         // Auto-pick best preset based on aspect ratio
         const ar = srcW / srcH;
         if (Math.abs(ar - 240/320) < Math.abs(ar - 480/320)) {
@@ -219,9 +219,8 @@
       if (!srcImg) return;
       renderResult();
       renderSourcePreview();
-      const stride = Math.floor((targetW * 2 + 3) / 4) * 4;
       document.getElementById('size-hint').textContent =
-        'Output: ' + targetW + '×' + targetH + '  |  BMP ~' + ((66 + stride * targetH) / 1024).toFixed(1) + ' KB';
+        'Output: ' + targetW + '×' + targetH + ' px  |  JPEG quality 100';
       document.getElementById('src-lbl').textContent = 'Source (' + srcW + '×' + srcH + ')';
       document.getElementById('res-lbl').textContent = 'Output (' + targetW + '×' + targetH + ')';
     }
@@ -335,49 +334,11 @@
     srcCv.addEventListener('touchmove',  dragMove,  { passive: false });
     srcCv.addEventListener('touchend',   dragEnd);
 
-    // ── BMP generation ──────────────────────────────────────────────────────────
-    function w32(b, o, v) {
-      const u = v >>> 0;
-      b[o]=u&0xFF; b[o+1]=(u>>8)&0xFF; b[o+2]=(u>>16)&0xFF; b[o+3]=(u>>24)&0xFF;
-    }
-    function w16(b, o, v) { b[o]=v&0xFF; b[o+1]=(v>>8)&0xFF; }
-
-    function makeBmp() {
-      const rc = document.getElementById('res-cv');
-      const W = rc.width, H = rc.height;
-      const px = rc.getContext('2d').getImageData(0, 0, W, H).data;
-      const stride = Math.floor((W * 2 + 3) / 4) * 4;
-      const buf = new Uint8Array(66 + stride * H);
-      // File header
-      buf[0] = 0x42; buf[1] = 0x4D;
-      w32(buf,  2, 66 + stride * H);   // file size
-      w32(buf, 10, 66);                 // pixel data offset
-      // Info header
-      w32(buf, 14, 40);                 // BITMAPINFOHEADER size
-      w32(buf, 18, W);                  // width
-      w32(buf, 22, H);                  // height positive → bottom-up rows
-      w16(buf, 26, 1);                  // color planes
-      w16(buf, 28, 16);                 // bits per pixel
-      w32(buf, 30, 3);                  // BI_BITFIELDS
-      w32(buf, 34, stride * H);         // image data size
-      w32(buf, 38, 2835); w32(buf, 42, 2835); // pixels/meter
-      // RGB565 masks
-      w32(buf, 54, 0xF800);             // R mask
-      w32(buf, 58, 0x07E0);             // G mask
-      w32(buf, 62, 0x001F);             // B mask
-      // Pixel data — bottom-up (disk row 0 = image bottom row)
-      for (let row = 0; row < H; row++) {
-        const base = 66 + (H - 1 - row) * stride;
-        for (let col = 0; col < W; col++) {
-          const s = (row * W + col) * 4;
-          const v = ((px[s]   >> 3) << 11)   // R5
-                  | ((px[s+1] >> 2) <<  5)   // G6
-                  |  (px[s+2] >> 3);          // B5
-          buf[base + col * 2]     = v & 0xFF;
-          buf[base + col * 2 + 1] = (v >> 8) & 0xFF;
-        }
-      }
-      return buf;
+    // ── JPEG generation ─────────────────────────────────────────────────────────
+    function makeJpeg() {
+      return new Promise(resolve =>
+        document.getElementById('res-cv').toBlob(resolve, 'image/jpeg', 1.0)
+      );
     }
 
     // ── Upload / Download ───────────────────────────────────────────────────────
@@ -386,14 +347,14 @@
       const fname = document.getElementById('fname').value.trim();
       if (!fname) { setStatus('Enter a filename', 'err'); return; }
       setStatus('Converting…', 'dim');
-      let bmp;
-      try { bmp = makeBmp(); } catch (e) { setStatus('Convert error: ' + e.message, 'err'); return; }
+      let blob;
+      try { blob = await makeJpeg(); } catch (e) { setStatus('Convert error: ' + e.message, 'err'); return; }
       setStatus('Uploading ' + fname + '…', 'dim');
       try {
         const r = await fetch('/upload?name=' + encodeURIComponent(fname), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: bmp
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: blob
         });
         if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
         setStatus('✓ Uploaded as ' + fname, 'ok');
@@ -402,10 +363,11 @@
       }
     }
 
-    function doDownload() {
+    async function doDownload() {
       if (!srcImg) return;
-      const fname = document.getElementById('fname').value.trim() || 'image.bmp';
-      const url = URL.createObjectURL(new Blob([makeBmp()], { type: 'image/bmp' }));
+      const fname = document.getElementById('fname').value.trim() || 'image.jpg';
+      const blob = await makeJpeg();
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = fname; a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);

@@ -1979,6 +1979,12 @@ CONFIG_VFS_SEMIHOSTFS_MAX_MOUNT_POINTS=1
 
 CONFIG_VFS_INITIALIZE_DEV_NULL=y
 # end of Virtual file system
+
+#
+# JPEG Decoder
+#
+CONFIG_JD_USE_ROM=y
+# end of JPEG Decoder
 # end of Component config
 
 # CONFIG_IDF_EXPERIMENTAL_FEATURES is not set
