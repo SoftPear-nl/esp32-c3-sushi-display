@@ -25,6 +25,7 @@
     .btn-add{background:#28a745;color:#fff;padding:.38em 1em;font-size:.9em}.btn-add:hover{background:#218838}
     .btn-save{background:#3a7bd5;color:#fff;padding:.38em 1.1em;font-size:.9em;margin-left:.4em}.btn-save:hover{background:#2f6abf}
     .btn-reload{background:#6c757d;color:#fff;padding:.38em .9em;font-size:.9em;margin-left:.4em}.btn-reload:hover{background:#5a6268}
+    .btn-dl2{background:#17a2b8;color:#fff;padding:.38em .9em;font-size:.9em;margin-left:.4em}.btn-dl2:hover{background:#138496}
     .field{margin-bottom:.45em;font-size:.87em}
     .field label{display:block;font-size:.82em;color:#556;margin-bottom:.1em}
     .field-row{display:flex;gap:.6em}
@@ -51,6 +52,7 @@
       <button class="btn-add" onclick="addScene()">+ Add Scene</button>
       <button class="btn-save" onclick="saveSeq()">💾 Save &amp; Apply</button>
       <button class="btn-reload" onclick="loadAll()">↺ Reload</button>
+      <button class="btn-dl2" onclick="downloadSeq()">⬇ Download</button>
     </div>
   </div>
 
@@ -274,6 +276,15 @@
       } catch (e) {
         stat('Save failed: ' + e.message, 'err');
       }
+    }
+
+    function downloadSeq() {
+      const blob = new Blob([JSON.stringify(scenes, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'sequence.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
     }
 
     function stat(msg, cls) {
