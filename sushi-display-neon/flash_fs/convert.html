@@ -57,7 +57,7 @@
          ondragover="event.preventDefault();this.classList.add('over')"
          ondragleave="this.classList.remove('over')"
          ondrop="onDrop(event)">
-      Tap or drag an image here — converts to JPEG (quality 100) for the display
+      Tap or drag an image here — converts to JPEG for the display
     </div>
     <input id="file-input" type="file" accept="image/*" onchange="loadFile(event.target.files[0])">
     <div id="src-info" style="font-size:.82em;color:#556;margin-top:.3em"></div>
@@ -123,6 +123,11 @@
     <div class="row">
       <span class="lbl">Filename</span>
       <input type="text" id="fname" value="image.bmp" style="flex:1">
+    </div>
+    <div class="row" style="margin-top:.35em;align-items:center;gap:.6em">
+      <span class="lbl">JPEG quality</span>
+      <input type="range" id="quality" min="0" max="100" value="90" style="flex:1;max-width:140px" oninput="qualityChanged()">
+      <span id="quality-val" style="font-size:.86em;min-width:2.5em">90</span>
     </div>
     <div class="row" style="margin-top:.35em">
       <button class="btn-p" onclick="doUpload()">⬆ Convert &amp; Upload</button>
@@ -220,7 +225,7 @@
       renderResult();
       renderSourcePreview();
       document.getElementById('size-hint').textContent =
-        'Output: ' + targetW + '×' + targetH + ' px  |  JPEG quality 100';
+        'Output: ' + targetW + '×' + targetH + ' px  |  JPEG quality ' + document.getElementById('quality').value;
       document.getElementById('src-lbl').textContent = 'Source (' + srcW + '×' + srcH + ')';
       document.getElementById('res-lbl').textContent = 'Output (' + targetW + '×' + targetH + ')';
     }
@@ -334,10 +339,16 @@
     srcCv.addEventListener('touchmove',  dragMove,  { passive: false });
     srcCv.addEventListener('touchend',   dragEnd);
 
+    function qualityChanged() {
+      document.getElementById('quality-val').textContent = document.getElementById('quality').value;
+      if (srcImg) render();
+    }
+
     // ── JPEG generation ─────────────────────────────────────────────────────────
     function makeJpeg() {
+      const q = parseInt(document.getElementById('quality').value, 10) / 100;
       return new Promise(resolve =>
-        document.getElementById('res-cv').toBlob(resolve, 'image/jpeg', 1.0)
+        document.getElementById('res-cv').toBlob(resolve, 'image/jpeg', q)
       );
     }
 
