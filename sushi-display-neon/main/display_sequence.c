@@ -380,6 +380,12 @@ static void scene_bounce(esp_lcd_panel_handle_t panel, const scene_t *s);
 static void scene_anim_dual(esp_lcd_panel_handle_t panel1,
                              esp_lcd_panel_handle_t panel2,
                              const scene_t *s);
+static void scene_anim_mjpeg(esp_lcd_panel_handle_t panel1,
+                              esp_lcd_panel_handle_t panel2,
+                              const scene_t *s);
+static void scale_half(const uint16_t *frame_buf, int anim_w,
+                        int src_col_offset, int src_w, int src_h,
+                        int scale, uint16_t *dest);
 
 // ---------------------------------------------------------------------------
 // Single-scene dispatcher (used by both sequential and parallel paths)
@@ -402,9 +408,14 @@ static void run_single_scene(esp_lcd_panel_handle_t panel1,
         case SCENE_BOUNCE:
             scene_bounce(panel, s);
             break;
-        case SCENE_ANIM_DUAL:
-            scene_anim_dual(panel1, panel2, s);
+        case SCENE_ANIM_DUAL: {
+            const char *ext = strrchr(s->file_path, '.');
+            if (ext && strcasecmp(ext, ".mjb") == 0)
+                scene_anim_mjpeg(panel1, panel2, s);
+            else
+                scene_anim_dual(panel1, panel2, s);
             break;
+        }
         default:
             ESP_LOGW(TAG, "Unknown scene type %d – skipped", (int)s->type);
             break;
@@ -566,6 +577,145 @@ static void scene_bounce(esp_lcd_panel_handle_t panel, const scene_t *s)
 }
 
 // ===========================================================================
+// SCENE_ANIM_DUAL  (MJPEG variant — .mjb format)
+// ===========================================================================
+/**
+ * .mjb file format (from animate.html tool):
+ *   bytes  0-1  : image width            (uint16_t LE)
+ *   bytes  2-3  : image height           (uint16_t LE)
+ *   bytes  4-5  : frame count            (uint16_t LE)
+ *   bytes  6-7  : fps                    (uint16_t LE)
+ *   bytes  8-9  : JPEG quality × 100     (uint16_t LE, informational)
+ *   bytes 10-11 : reserved               (uint16_t LE = 0)
+ *   bytes 12-15 : max single-frame size  (uint32_t LE, for pre-allocation)
+ *   per frame:
+ *     uint32_t  size   (LE) — JPEG payload length in bytes
+ *     uint8_t   data[] — raw JPEG bytes
+ *
+ * Decoded to RGB565 with esp_jpeg_decode, then scaled/blitted identically to
+ * scene_anim_dual (same DUAL_SAME / DUAL_SPLIT_H / scale logic).
+ */
+static void scene_anim_mjpeg(esp_lcd_panel_handle_t panel1,
+                              esp_lcd_panel_handle_t panel2,
+                              const scene_t *s)
+{
+    FILE *f = fopen(s->file_path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "anim mjpeg: cannot open '%s'", s->file_path);
+        return;
+    }
+
+    uint8_t hdr[16];
+    if (fread(hdr, 1, sizeof(hdr), f) < sizeof(hdr)) {
+        ESP_LOGE(TAG, "anim mjpeg: short header in '%s'", s->file_path);
+        fclose(f); return;
+    }
+    int      anim_w     = (int)(hdr[0]  | (hdr[1]  << 8));
+    int      anim_h     = (int)(hdr[2]  | (hdr[3]  << 8));
+    int      frames     = (int)(hdr[4]  | (hdr[5]  << 8));
+    int      fps        = (int)(hdr[6]  | (hdr[7]  << 8));
+    uint32_t max_jpg_sz = (uint32_t)(hdr[12] | ((uint32_t)hdr[13]<<8)
+                                              | ((uint32_t)hdr[14]<<16)
+                                              | ((uint32_t)hdr[15]<<24));
+    int64_t  frame_us   = (fps > 0) ? (1000000LL / fps) : 100000LL;
+    int      sc         = (s->scale > 1) ? s->scale : 1;
+
+    ESP_LOGI(TAG, "anim mjpeg: %dx%d  %d frames @ %d fps  scale=%d  max_jpg=%lu B",
+             anim_w, anim_h, frames, fps, sc, (unsigned long)max_jpg_sz);
+
+    uint8_t *jpeg_buf = heap_caps_malloc(max_jpg_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpeg_buf) {
+        ESP_LOGE(TAG, "anim mjpeg: OOM jpeg buffer (%lu B)", (unsigned long)max_jpg_sz);
+        fclose(f); return;
+    }
+
+    size_t frame_bytes = (size_t)anim_w * anim_h * 2;
+    uint16_t *frame_buf = heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!frame_buf) {
+        ESP_LOGE(TAG, "anim mjpeg: OOM frame buffer");
+        free(jpeg_buf); fclose(f); return;
+    }
+
+    int half_src_w = (s->dual_mode == DUAL_SPLIT_H) ? anim_w / 2 : anim_w;
+    int out_w      = half_src_w * sc;
+    int out_h      = anim_h     * sc;
+    int draw_w     = out_w < LCD_W ? out_w : LCD_W;
+    int draw_h     = out_h < LCD_H ? out_h : LCD_H;
+    int off_x      = (LCD_W - draw_w) / 2;
+    int off_y      = (LCD_H - draw_h) / 2;
+    size_t out_bytes = (size_t)out_w * out_h * 2;
+
+    uint16_t *buf1 = heap_caps_malloc(out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint16_t *buf2 = heap_caps_malloc(out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf1 || !buf2) {
+        ESP_LOGE(TAG, "anim mjpeg: OOM output buffers");
+        free(buf1); free(buf2); free(frame_buf); free(jpeg_buf); fclose(f); return;
+    }
+
+    clear_screen(panel1);
+    clear_screen(panel2);
+
+    for (int fi = 0; fi < frames; fi++) {
+        int64_t t0 = esp_timer_get_time();
+
+        uint8_t sz_bytes[4];
+        if (fread(sz_bytes, 1, 4, f) < 4) {
+            ESP_LOGW(TAG, "anim mjpeg: short frame-size read at frame %d", fi);
+            break;
+        }
+        uint32_t jpg_sz = (uint32_t)(sz_bytes[0] | ((uint32_t)sz_bytes[1]<<8)
+                                                  | ((uint32_t)sz_bytes[2]<<16)
+                                                  | ((uint32_t)sz_bytes[3]<<24));
+
+        if (fread(jpeg_buf, 1, jpg_sz, f) < jpg_sz) {
+            ESP_LOGW(TAG, "anim mjpeg: short jpeg read at frame %d", fi);
+            break;
+        }
+
+        esp_jpeg_image_cfg_t cfg = {
+            .indata      = jpeg_buf,
+            .indata_size = jpg_sz,
+            .outbuf      = (uint8_t *)frame_buf,
+            .outbuf_size = frame_bytes,
+            .out_format  = JPEG_IMAGE_FORMAT_RGB565,
+            .out_scale   = JPEG_IMAGE_SCALE_0,
+            .flags       = { .swap_color_bytes = 1 }, // LE->BE for ST7789
+        };
+        esp_jpeg_image_output_t out_img;
+        esp_err_t ret = esp_jpeg_decode(&cfg, &out_img);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "anim mjpeg: decode err %d at frame %d", ret, fi);
+        }
+
+        if (s->dual_mode == DUAL_SPLIT_H) {
+            scale_half(frame_buf, anim_w, 0,          half_src_w, anim_h, sc, buf1);
+            scale_half(frame_buf, anim_w, half_src_w, half_src_w, anim_h, sc, buf2);
+        } else {
+            scale_half(frame_buf, anim_w, 0, anim_w, anim_h, sc, buf1);
+            memcpy(buf2, buf1, out_bytes);
+        }
+
+        esp_lcd_panel_draw_bitmap(panel1, off_x, off_y, off_x + draw_w, off_y + draw_h, buf1);
+        esp_lcd_panel_draw_bitmap(panel2, off_x, off_y, off_x + draw_w, off_y + draw_h, buf2);
+
+        int64_t target_us = frame_us;
+        if      (fi == 0          && s->first_frame_ms > 0) target_us = (int64_t)s->first_frame_ms * 1000;
+        else if (fi == frames - 1 && s->last_frame_ms  > 0) target_us = (int64_t)s->last_frame_ms  * 1000;
+
+        int64_t elapsed_us   = esp_timer_get_time() - t0;
+        int64_t remaining_ms = (target_us - elapsed_us) / 1000;
+        TickType_t ticks = (remaining_ms > 0) ? pdMS_TO_TICKS((uint32_t)remaining_ms) : 0;
+        vTaskDelay(ticks > 0 ? ticks : 1);
+        if (s_abort_requested) break;
+    }
+
+    free(buf1);
+    free(buf2);
+    free(frame_buf);
+    free(jpeg_buf);
+    fclose(f);
+}
+
 // SCENE_ANIM_DUAL
 // ===========================================================================
 /**

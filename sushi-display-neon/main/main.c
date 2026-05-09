@@ -83,11 +83,11 @@ static const char *s_display_mode_names[] = {
 #define PIN_NUM_DC            8
 #define PIN_NUM_RST           5
 
-#define PIN_LETTER_S1       15
-#define PIN_LETTER_U        16
-#define PIN_LETTER_S2       17
+#define PIN_LETTER_S1       17
+#define PIN_LETTER_U        4
+#define PIN_LETTER_S2       15
 #define PIN_LETTER_H        18
-#define PIN_LETTER_I        4
+#define PIN_LETTER_I        16
 
 // -------------------- 5-way switch --------------------
 // NOTE: GPIO 26-32 = internal flash; GPIO 33-40 = OctalSPI PSRAM (N16R8).
@@ -815,6 +815,29 @@ static esp_err_t convert_page_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// GET /animate — serve the animation-converter HTML page from SPIFFS
+static esp_err_t animate_page_handler(httpd_req_t *req)
+{
+    FILE *f = fopen("/spiffs/animate.html", "r");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "animate.html not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "text/html");
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
+            fclose(f);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static void wifi_http_start(void)
 {
     // Initialise the one-time WiFi prerequisites lazily so they don't consume
@@ -853,7 +876,7 @@ static void wifi_http_start(void)
     httpd_config_t hcfg    = HTTPD_DEFAULT_CONFIG();
     hcfg.stack_size        = 8192;  // file I/O needs more than the 4 KB default
     hcfg.recv_wait_timeout = 30;    // seconds; needed for large file uploads
-    hcfg.max_uri_handlers  = 12;
+    hcfg.max_uri_handlers  = 13;
     if (httpd_start(&s_httpd, &hcfg) == ESP_OK) {
         static const httpd_uri_t uri_root     = { .uri="/",             .method=HTTP_GET,  .handler=hello_get_handler         };
         static const httpd_uri_t uri_files    = { .uri="/api/files",    .method=HTTP_GET,  .handler=api_files_handler         };
@@ -864,6 +887,7 @@ static void wifi_http_start(void)
         static const httpd_uri_t uri_seq_post = { .uri="/api/sequence", .method=HTTP_POST, .handler=api_sequence_post_handler };
         static const httpd_uri_t uri_seq_page = { .uri="/sequences",    .method=HTTP_GET,  .handler=sequences_page_handler    };
         static const httpd_uri_t uri_conv_page= { .uri="/convert",      .method=HTTP_GET,  .handler=convert_page_handler      };
+        static const httpd_uri_t uri_anim_page = { .uri="/animate",      .method=HTTP_GET,  .handler=animate_page_handler      };
         httpd_register_uri_handler(s_httpd, &uri_root);
         httpd_register_uri_handler(s_httpd, &uri_files);
         httpd_register_uri_handler(s_httpd, &uri_download);
@@ -873,6 +897,7 @@ static void wifi_http_start(void)
         httpd_register_uri_handler(s_httpd, &uri_seq_post);
         httpd_register_uri_handler(s_httpd, &uri_seq_page);
         httpd_register_uri_handler(s_httpd, &uri_conv_page);
+        httpd_register_uri_handler(s_httpd, &uri_anim_page);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "HTTP server failed to start");

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sushi Display — Animation Converter</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:sans-serif;background:#e8f4f8;color:#1a1a2e;padding:1em;max-width:760px;margin:0 auto}
+    h1{margin-bottom:.4em;font-size:1.5em}
+    h2{font-size:1.05em;font-weight:600;margin-bottom:.5em;color:#334}
+    .nav{margin-bottom:.9em;font-size:.88em}
+    .nav a{color:#3a7bd5;text-decoration:none}
+    .nav a:hover{text-decoration:underline}
+    .card{background:#fff;border-radius:8px;padding:.9em 1em;box-shadow:0 1px 4px rgba(0,0,0,.12);margin-bottom:.75em}
+    #drop-zone{border:2px dashed #aac;border-radius:6px;padding:1.4em;text-align:center;color:#779;cursor:pointer;transition:background .2s}
+    #drop-zone.over{background:#d6eaf8;border-color:#3a7bd5}
+    #file-input{display:none}
+    .row{display:flex;gap:.6em;flex-wrap:wrap;align-items:center;margin-bottom:.4em}
+    .lbl{font-size:.84em;color:#556;white-space:nowrap}
+    select,input[type=text],input[type=number]{padding:.25em .4em;border:1px solid #ccd;border-radius:4px;font-size:.86em;background:#f9f9ff}
+    input[type=range]{flex:1;max-width:140px;accent-color:#3a7bd5;padding:0}
+    .seg{display:flex;border:1px solid #ccd;border-radius:4px;overflow:hidden}
+    .seg button{border:none;border-radius:0;background:#f9f9ff;color:#556;padding:.26em .7em;font-size:.84em;font-weight:600;cursor:pointer;transition:background .15s}
+    .seg button.on{background:#3a7bd5;color:#fff}
+    .seg button+button{border-left:1px solid #ccd}
+    .btn-p{background:#3a7bd5;color:#fff;border:none;border-radius:4px;padding:.38em 1em;font-size:.88em;font-weight:600;cursor:pointer;transition:background .15s}
+    .btn-p:hover{background:#2f6abf}
+    .btn-p:disabled{opacity:.4;cursor:default}
+    .btn-s{background:#6c757d;color:#fff;border:none;border-radius:4px;padding:.38em 1em;font-size:.88em;font-weight:600;cursor:pointer;transition:background .15s}
+    .btn-s:hover{background:#5a6268}
+    .btn-s:disabled{opacity:.4;cursor:default}
+    .progress-bar{height:8px;background:#dde;border-radius:4px;overflow:hidden;margin:.4em 0}
+    .progress-fill{height:100%;background:#3a7bd5;border-radius:4px;transition:width .08s linear}
+    .frame-gallery{display:flex;flex-wrap:wrap;gap:4px;max-height:200px;overflow-y:auto;background:#111;padding:6px;border-radius:6px;margin-top:.5em}
+    .frame-thumb{position:relative}
+    .frame-thumb canvas{display:block;border-radius:2px}
+    .frame-thumb .fnum{position:absolute;bottom:1px;left:2px;font-size:9px;background:rgba(0,0,0,.7);color:#fff;padding:0 3px;border-radius:2px}
+    #status{min-height:1.2em;font-size:.84em;padding:.2em 0}
+    .ok{color:#218838;font-weight:600}
+    .err{color:#c70030;font-weight:600}
+    .dim{color:#778}
+    canvas{display:none}
+  </style>
+</head>
+<body>
+  <h1>🍣 Animation Converter</h1>
+  <div class="nav">
+    <a href="/">← File Manager</a> · <a href="/sequences">Sequences</a> · <a href="/convert">Image Converter</a>
+  </div>
+
+  <div class="card">
+    <div id="drop-zone"
+         onclick="document.getElementById('file-input').click()"
+         ondragover="event.preventDefault();this.classList.add('over')"
+         ondragleave="this.classList.remove('over')"
+         ondrop="onDrop(event)">
+      Tap or drag an animated GIF here — converts to MJPEG .mjb for the display
+    </div>
+    <input id="file-input" type="file" accept="image/gif,.gif" onchange="loadFile(event.target.files[0])">
+    <div id="gif-info" style="font-size:.82em;color:#556;margin-top:.3em"></div>
+  </div>
+
+  <div id="cfg-card" class="card" style="display:none">
+    <h2>Output Size</h2>
+    <div class="row" style="gap:.5em;margin-bottom:.5em">
+      <div class="seg">
+        <button id="ps-single" class="on" onclick="setPreset(240,320,this)">Single (240×320)</button>
+        <button id="ps-dual"         onclick="setPreset(480,320,this)">Dual  (480×320)</button>
+        <button id="ps-custom"       onclick="setPreset(0,0,this)">Custom</button>
+      </div>
+    </div>
+    <div id="custom-row" class="row" style="display:none">
+      <span class="lbl">W</span><input type="number" id="out-w" value="240" min="1" max="960" style="width:5em" oninput="customSize()">
+      <span class="lbl">H</span><input type="number" id="out-h" value="320" min="1" max="960" style="width:5em" oninput="customSize()">
+    </div>
+
+    <h2 style="margin-top:.75em">Fit</h2>
+    <div class="seg">
+      <button id="m-contain" class="on" onclick="setFit('contain',this)">Contain</button>
+      <button id="m-cover"               onclick="setFit('cover',this)">Cover &amp; Crop</button>
+    </div>
+
+    <h2 style="margin-top:.75em">JPEG Quality</h2>
+    <div class="row">
+      <span class="lbl">Quality</span>
+      <input type="range" id="quality" min="50" max="100" value="85" oninput="document.getElementById('q-val').textContent=this.value">
+      <span id="q-val" style="font-size:.86em;color:#556;min-width:2em">85</span>
+      <span class="lbl dim">· 50 = smallest · 100 = best</span>
+    </div>
+  </div>
+
+  <div id="prev-card" class="card" style="display:none">
+    <h2>Preview <span id="frame-count" style="font-weight:400;font-size:.85em;color:#556"></span></h2>
+    <div class="frame-gallery" id="frame-gallery">
+      <span style="color:#888;font-size:.82em;padding:4px">Convert to preview frames</span>
+    </div>
+    <div id="size-hint" style="font-size:.8em;color:#778;margin-top:.4em"></div>
+  </div>
+
+  <div id="out-card" class="card" style="display:none">
+    <h2>Export</h2>
+    <div class="row">
+      <span class="lbl">Filename</span>
+      <input type="text" id="fname" value="animation.mjb" style="flex:1">
+    </div>
+    <div class="row" style="margin-top:.4em">
+      <button class="btn-p" id="btn-convert" onclick="doConvert()" disabled>▶ Convert</button>
+      <button class="btn-p" id="btn-upload"  onclick="doUpload()"  disabled style="margin-left:.4em">⬆ Upload to Device</button>
+      <button class="btn-s" id="btn-dl"      onclick="doDownload()" disabled style="margin-left:.4em">↓ Download .mjb</button>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+    <div id="status"></div>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script>
+  (() => {
+    // ── State ──────────────────────────────────────────────────────────────────
+    let gifFrames = [], binBlob = null, isConverting = false;
+    let targetW = 240, targetH = 320, fitMode = 'contain';
+
+    const canvas = document.getElementById('canvas');
+    const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+
+    // ── UI helpers ─────────────────────────────────────────────────────────────
+    function setStatus(msg, cls) {
+      const el = document.getElementById('status');
+      el.textContent = msg; el.className = cls || '';
+    }
+    function setProgress(f) {
+      document.getElementById('progress-fill').style.width = (f * 100).toFixed(1) + '%';
+    }
+    const yieldBrowser = () => new Promise(r => setTimeout(r, 0));
+
+    // ── Preset / size controls ─────────────────────────────────────────────────
+    function setPreset(w, h, btn) {
+      document.querySelectorAll('.seg button[id^="ps-"]').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      const custom = btn.id === 'ps-custom';
+      document.getElementById('custom-row').style.display = custom ? '' : 'none';
+      if (!custom) { targetW = w; targetH = h; }
+    }
+    function customSize() {
+      targetW = Math.max(1, parseInt(document.getElementById('out-w').value) || 240);
+      targetH = Math.max(1, parseInt(document.getElementById('out-h').value) || 320);
+    }
+    function setFit(m, btn) {
+      fitMode = m;
+      document.querySelectorAll('.seg button[id^="m-"]').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+    }
+
+    // ── Drop / file load ───────────────────────────────────────────────────────
+    function onDrop(e) {
+      e.preventDefault();
+      document.getElementById('drop-zone').classList.remove('over');
+      const f = e.dataTransfer.files[0];
+      if (f) loadFile(f);
+    }
+
+    function loadFile(file) {
+      if (!file) return;
+      gifFrames = []; binBlob = null;
+      document.getElementById('btn-convert').disabled = true;
+      document.getElementById('btn-upload').disabled  = true;
+      document.getElementById('btn-dl').disabled      = true;
+      setStatus('Parsing GIF…', 'dim');
+      const reader = new FileReader();
+      reader.onload = e => {
+        try {
+          gifFrames = parseGIF(e.target.result);
+          const avgDelay = gifFrames.reduce((s,f) => s + f.delayMs, 0) / gifFrames.length;
+          const nfps = Math.round(1000 / avgDelay);
+          const { width: gw, height: gh } = gifFrames[0];
+          document.getElementById('gif-info').textContent =
+            `${gifFrames.length} frames · ${gw}×${gh} · ~${nfps} fps · ${(e.target.result.byteLength/1024).toFixed(1)} KB`;
+          // Auto-guess best preset
+          const ar = gw / gh;
+          if (Math.abs(ar - 240/320) <= Math.abs(ar - 480/320)) {
+            targetW = 240; targetH = 320;
+            document.getElementById('ps-single').classList.add('on');
+            document.getElementById('ps-dual').classList.remove('on');
+          } else {
+            targetW = 480; targetH = 320;
+            document.getElementById('ps-dual').classList.add('on');
+            document.getElementById('ps-single').classList.remove('on');
+          }
+          const base = file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,27);
+          document.getElementById('fname').value = base + '.mjb';
+          ['cfg-card','prev-card','out-card'].forEach(id =>
+            document.getElementById(id).style.display = '');
+          document.getElementById('btn-convert').disabled = false;
+          setStatus(`Loaded ${gifFrames.length} frames. Click Convert.`, '');
+        } catch(err) {
+          setStatus('Failed: ' + err.message, 'err');
+        }
+      };
+      reader.onerror = () => setStatus('FileReader error', 'err');
+      reader.readAsArrayBuffer(file);
+    }
+
+    // ── Convert ────────────────────────────────────────────────────────────────
+    async function doConvert() {
+      if (isConverting || !gifFrames.length) return;
+      isConverting = true;
+      binBlob = null;
+      document.getElementById('btn-convert').disabled = true;
+      document.getElementById('btn-upload').disabled  = true;
+      document.getElementById('btn-dl').disabled      = true;
+      document.getElementById('frame-gallery').innerHTML = '';
+      setProgress(0);
+
+      const outW = targetW, outH = targetH;
+      const quality = parseInt(document.getElementById('quality').value) / 100;
+      const avgDelay = gifFrames.reduce((s,f) => s + f.delayMs, 0) / gifFrames.length;
+      const fps = Math.max(1, Math.round(1000 / avgDelay));
+
+      const jpegParts = [null]; // slot 0 reserved for header, filled after loop
+      let maxJpegSz = 0;
+
+      try {
+        for (let i = 0; i < gifFrames.length; i++) {
+          setStatus(`Encoding frame ${i+1} / ${gifFrames.length}…`, 'dim');
+          const gf = gifFrames[i];
+          const scaled = scaleFrame(gf.pixels, gf.width, gf.height, outW, outH, fitMode);
+          // canvas already has the scaled frame drawn by scaleFrame
+          const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', quality));
+          const szBuf = new ArrayBuffer(4);
+          new DataView(szBuf).setUint32(0, blob.size, true);
+          jpegParts.push(szBuf, blob);
+          if (blob.size > maxJpegSz) maxJpegSz = blob.size;
+          addThumb(scaled, i);
+          setProgress((i+1) / gifFrames.length);
+          await yieldBrowser();
+        }
+        // 16-byte header: w(2) h(2) frames(2) fps(2) quality×100(2) reserved(2) max_frame_size(4)
+        const hdrBuf = new ArrayBuffer(16);
+        const dv = new DataView(hdrBuf);
+        dv.setUint16(0, outW,                    true);
+        dv.setUint16(2, outH,                    true);
+        dv.setUint16(4, gifFrames.length,        true);
+        dv.setUint16(6, fps,                     true);
+        dv.setUint16(8, Math.round(quality*100), true);
+        dv.setUint16(10, 0,                      true);
+        dv.setUint32(12, maxJpegSz,              true);
+        jpegParts[0] = hdrBuf;
+        binBlob = new Blob(jpegParts, { type: 'application/octet-stream' });
+        const totalBytes = jpegParts.reduce((s, p) =>
+          s + (p instanceof Blob ? p.size : p.byteLength), 0);
+        const kb = (totalBytes / 1024).toFixed(1);
+        document.getElementById('frame-count').textContent =
+          `— ${gifFrames.length} × ${outW}×${outH} @ ${fps} fps`;
+        document.getElementById('size-hint').textContent =
+          `Output: ${outW}×${outH}  ·  ${gifFrames.length} frames  ·  ${fps} fps  ·  JPEG q${Math.round(quality*100)}  ·  ${kb} KB`;
+        setStatus(`Done — ${kb} KB`, 'ok');
+        document.getElementById('btn-upload').disabled = false;
+        document.getElementById('btn-dl').disabled     = false;
+      } catch(err) {
+        setStatus('Error: ' + err.message, 'err');
+      } finally {
+        isConverting = false;
+        document.getElementById('btn-convert').disabled = false;
+      }
+    }
+
+    // ── Upload / Download ──────────────────────────────────────────────────────
+    async function doUpload() {
+      if (!binBlob) return;
+      const fname = document.getElementById('fname').value.trim();
+      if (!fname) { setStatus('Enter a filename', 'err'); return; }
+      setStatus('Uploading…', 'dim');
+      try {
+        const r = await fetch('/upload?name=' + encodeURIComponent(fname), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: binBlob
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
+        setStatus('✓ Uploaded as ' + fname, 'ok');
+      } catch(e) {
+        setStatus('Upload failed: ' + e.message, 'err');
+      }
+    }
+
+    function doDownload() {
+      if (!binBlob) return;
+      const fname = document.getElementById('fname').value.trim() || 'animation.mjb';
+      const url = URL.createObjectURL(binBlob);
+      const a = document.createElement('a');
+      a.href = url; a.download = fname; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    // ── Thumbnail ──────────────────────────────────────────────────────────────
+    function addThumb(imageData, idx) {
+      const TW = 48, TH = Math.max(1, Math.round(TW * imageData.height / imageData.width));
+      const full = new OffscreenCanvas(imageData.width, imageData.height);
+      full.getContext('2d').putImageData(imageData, 0, 0);
+      const tc = document.createElement('canvas');
+      tc.width = TW; tc.height = TH;
+      tc.style.cssText = `width:${TW}px;height:${TH}px`;
+      tc.getContext('2d').drawImage(full, 0, 0, TW, TH);
+      const wrap = document.createElement('div');
+      wrap.className = 'frame-thumb';
+      const lbl = document.createElement('span');
+      lbl.className = 'fnum'; lbl.textContent = idx;
+      wrap.appendChild(tc); wrap.appendChild(lbl);
+      document.getElementById('frame-gallery').appendChild(wrap);
+    }
+
+    function scaleFrame(srcPixels, srcW, srcH, outW, outH, fit) {
+      const tmp = new OffscreenCanvas(srcW, srcH);
+      const id = tmp.getContext('2d').createImageData(srcW, srcH);
+      id.data.set(srcPixels);
+      tmp.getContext('2d').putImageData(id, 0, 0);
+      canvas.width = outW; canvas.height = outH;
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, outW, outH);
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      const sc = fit === 'cover' ? Math.max(outW/srcW, outH/srcH) : Math.min(outW/srcW, outH/srcH);
+      const dw = Math.round(srcW*sc), dh = Math.round(srcH*sc);
+      ctx.drawImage(tmp, 0,0,srcW,srcH, Math.floor((outW-dw)/2), Math.floor((outH-dh)/2), dw, dh);
+      return ctx.getImageData(0, 0, outW, outH);
+    }
+
+    // ── GIF parser (LZW, GIF89a, full disposal support) ───────────────────────
+    function parseGIF(buffer) {
+      const u8 = new Uint8Array(buffer);
+      let p = 0;
+      const r8  = () => u8[p++];
+      const r16 = () => { const v=u8[p]|(u8[p+1]<<8); p+=2; return v; };
+
+      if (String.fromCharCode(u8[0],u8[1],u8[2]) !== 'GIF') throw new Error('Not a GIF');
+      p = 6;
+      const lsW=r16(), lsH=r16(), pk=r8(); r8(); r8();
+      const hasGCT=pk>>7, gctSz=2<<(pk&7);
+      let gct=null;
+      if (hasGCT) { gct=new Uint8Array(u8.buffer,p,gctSz*3); p+=gctSz*3; }
+
+      const cv2=new OffscreenCanvas(lsW,lsH), ctx2=cv2.getContext('2d');
+      const rv2=new OffscreenCanvas(lsW,lsH), rctx2=rv2.getContext('2d');
+      const frames=[];
+      let gcDelay=100, gcTransp=-1, gcDisp=0;
+
+      function skipSub(){let s;while((s=r8())!==0)p+=s;}
+      function readSub(){const o=[];let s;while((s=r8())!==0){for(let i=0;i<s;i++)o.push(u8[p++]);}return new Uint8Array(o);}
+
+      function lzw(minCS, data) {
+        const cc=1<<minCS, eof=cc+1;
+        let cs=minCS+1, cm=(1<<cs)-1;
+        const tbl=[];
+        for(let i=0;i<cc;i++)tbl.push(new Uint8Array([i]));
+        tbl.push(null);tbl.push(null);
+        const out=[];
+        let bb=0,bl=0,dp=0,prev=-1;
+        function nc(){while(bl<cs){if(dp>=data.length)return eof;bb|=data[dp++]<<bl;bl+=8;}const c=bb&cm;bb>>=cs;bl-=cs;return c;}
+        function reset(){tbl.length=cc+2;cs=minCS+1;cm=(1<<cs)-1;prev=-1;}
+        reset();
+        for(;;){
+          const c=nc();if(c===eof)break;if(c===cc){reset();continue;}
+          let e;
+          if(c<tbl.length&&tbl[c])e=tbl[c];
+          else if(prev!==-1){const pv=tbl[prev];e=new Uint8Array(pv.length+1);e.set(pv);e[pv.length]=pv[0];}
+          else break;
+          for(let i=0;i<e.length;i++)out.push(e[i]);
+          if(prev!==-1&&tbl.length<4096){
+            const pv=tbl[prev],ne=new Uint8Array(pv.length+1);ne.set(pv);ne[ne.length-1]=e[0];tbl.push(ne);
+            if(tbl.length===(1<<cs)&&cs<12){cs++;cm=(1<<cs)-1;}
+          }
+          prev=c;
+        }
+        return new Uint8Array(out);
+      }
+
+      while(p<u8.length){
+        const sep=r8();
+        if(sep===0x3B)break;
+        if(sep===0x21){
+          const lbl=r8();
+          if(lbl===0xF9){r8();const gk=r8();gcDelay=r16()*10;if(gcDelay<20)gcDelay=100;gcTransp=(gk&1)?r8():(r8(),-1);gcDisp=(gk>>3)&7;r8();}
+          else skipSub();
+          continue;
+        }
+        if(sep===0x2C){
+          const ix=r16(),iy=r16(),iw=r16(),ih=r16(),ip=r8();
+          const hasLCT=(ip>>7)&1,intl=(ip>>6)&1,lctSz=2<<(ip&7);
+          let ct=gct;
+          if(hasLCT){ct=new Uint8Array(u8.buffer,p,lctSz*3);p+=lctSz*3;}
+          const minCS=r8(), indices=lzw(minCS,readSub());
+          let rows;
+          if(intl){
+            rows=new Array(ih);
+            let src=0;
+            for(const ps of [{s:0,st:8},{s:4,st:8},{s:2,st:4},{s:1,st:2}])
+              for(let y=ps.s;y<ih;y+=ps.st){rows[y]=indices.subarray(src,src+iw);src+=iw;}
+          } else {
+            rows=[];for(let y=0;y<ih;y++)rows.push(indices.subarray(y*iw,y*iw+iw));
+          }
+          rctx2.clearRect(0,0,lsW,lsH);rctx2.drawImage(cv2,0,0);
+          const id2=ctx2.getImageData(0,0,lsW,lsH),d=id2.data;
+          for(let y=0;y<ih;y++){const row=rows[y];for(let x=0;x<iw;x++){const idx=row[x];if(idx===gcTransp)continue;const dp2=((iy+y)*lsW+(ix+x))*4,cp=idx*3;d[dp2]=ct?ct[cp]:0;d[dp2+1]=ct?ct[cp+1]:0;d[dp2+2]=ct?ct[cp+2]:0;d[dp2+3]=255;}}
+          ctx2.putImageData(id2,0,0);
+          const snap=ctx2.getImageData(0,0,lsW,lsH);
+          frames.push({pixels:snap.data,delayMs:gcDelay,width:lsW,height:lsH});
+          if(gcDisp===2)ctx2.clearRect(ix,iy,iw,ih);
+          else if(gcDisp===3){ctx2.clearRect(0,0,lsW,lsH);ctx2.drawImage(rv2,0,0);}
+          gcTransp=-1;gcDelay=100;gcDisp=0;
+          continue;
+        }
+        break;
+      }
+      if(!frames.length)throw new Error('No frames decoded');
+      return frames;
+    }
+
+    // expose for HTML attributes
+    window.onDrop=onDrop; window.loadFile=loadFile;
+    window.setPreset=setPreset; window.customSize=customSize; window.setFit=setFit;
+    window.doConvert=doConvert; window.doUpload=doUpload; window.doDownload=doDownload;
+  })();
+  </script>
+</body>
+</html>
