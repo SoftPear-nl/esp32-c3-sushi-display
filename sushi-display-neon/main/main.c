@@ -530,9 +530,9 @@ static esp_err_t delete_handler(httpd_req_t *req)
 
 // ── Sequence storage & web API ──────────────────────────────────────────────
 
-#define MAX_DYN_SCENES  32
+#define MAX_DYN_SCENES  320
 #define SEQUENCE_PATH   "/spiffs/sequence.json"
-#define SEQ_BODY_MAX    16384
+#define SEQ_BODY_MAX    30000
 
 static scene_t  s_dyn_scenes[MAX_DYN_SCENES];
 static char     s_dyn_paths [MAX_DYN_SCENES][64];
